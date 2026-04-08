@@ -1,0 +1,36 @@
+# ─── Build artefacts ────────────────────────────────────────────────────────
+*.o
+*.elf
+*.rock
+*.ovl
+*.map
+*.a
+
+# ─── Rockbox build tree (if the plugin dir is inside a Rockbox checkout) ────
+/build/
+/build-*/
+
+# ─── GBA ROM / BIOS files (never commit copyrighted content) ────────────────
+*.gba
+*.GBA
+*.gb
+*.gbc
+*.zip
+*.7z
+gba_bios.bin
+bios.bin
+
+# ─── Save states and SRAM saves ─────────────────────────────────────────────
+*.sgm
+*.sav
+*.srm
+
+# ─── Editor and OS noise ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
