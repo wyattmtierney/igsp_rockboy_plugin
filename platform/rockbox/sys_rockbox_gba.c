@@ -80,70 +80,130 @@ size_t sys_heap_remaining(void)
  * VIDEO SUBSYSTEM
  * ========================================================================= */
 
+/*
+ * Nearest-neighbour scaling lookup tables.
+ * Populated once in vid_init(); no division in the hot blit path.
+ *
+ *   scale_x[lcd_col] → GBA source column  (0 … GBA_LCD_WIDTH-1  = 0..239)
+ *   scale_y[lcd_row] → GBA source row     (0 … GBA_LCD_HEIGHT-1 = 0..159)
+ *
+ * Both ranges fit in uint8_t, saving cache footprint vs int arrays.
+ */
+static uint8_t scale_x[LCD_WIDTH];    /* 320 bytes */
+static uint8_t scale_y[LCD_HEIGHT];   /* 240 bytes */
+
+/* Rockbox live framebuffer and row stride (in pixels, not bytes). */
+static fb_data *lcd_framebuf = NULL;
+static int      lcd_stride   = 0;
+
+/*
+ * Frameskip support.
+ *
+ *   frameskip == 0  → render every frame (default).
+ *   frameskip == N  → render 1 in every N+1 frames; rb->lcd_update() is
+ *                     skipped on the N intermediate frames.
+ *
+ * igpSP's main loop sets frameskip before the emulation loop; vid_update()
+ * checks it each call without any further initialisation required.
+ */
+int        frameskip          = 0;   /* externally settable; 0 = no skip    */
+static int frame_skip_counter = 0;   /* private countdown; reset each frame */
+
 void vid_init(void)
 {
-    /* TODO Phase 2: full initialisation.
+    int w, s;
+    int i;
+
+    /* Remove any backdrop that might bleed through direct framebuffer writes. */
+    rb->lcd_set_backdrop(NULL);
+
+    /* Obtain a direct pointer to the live Rockbox LCD framebuffer.
+     * lcd_stride is the row pitch in pixels (320 on the iPod Classic 6G). */
+    lcd_framebuf = rb->lcd_get_framebuffer(&w, &s);
+    lcd_stride   = s;
+
+    /* Full-screen viewport so rb->lcd_update() flushes the whole display. */
+    {
+        struct viewport vp;
+        rb->viewport_set_defaults(&vp, SCREEN_MAIN);
+        rb->lcd_set_viewport(&vp);
+    }
+
+    /* Pre-compute nearest-neighbour source-pixel lookup tables.
      *
-     *   1. Call rb->lcd_set_backdrop(NULL) to clear any backdrop image that
-     *      might interfere with direct framebuffer writes.
+     *   scale_x[dx] = dx * GBA_LCD_WIDTH  / LCD_WIDTH   (integer floor)
+     *   scale_y[dy] = dy * GBA_LCD_HEIGHT / LCD_HEIGHT  (integer floor)
      *
-     *   2. Obtain a writable pointer to the LCD framebuffer:
-     *        fb16_t *fb = rb->lcd_get_framebuffer(&width, &stride);
-     *      Store fb and stride in module-level statics for vid_update().
-     *
-     *   3. Set up a full-screen viewport:
-     *        struct viewport vp;
-     *        rb->viewport_set_defaults(&vp, SCREEN_MAIN);
-     *        rb->lcd_set_viewport(&vp);
-     *
-     *   4. Clear to black and flush once:
-     *        rb->lcd_clear_display();
-     *        rb->lcd_update();
+     * All integer division happens here at init time — zero division in
+     * the hot blit path.
      */
+    for (i = 0; i < LCD_WIDTH; i++)
+        scale_x[i] = (uint8_t)((i * GBA_LCD_WIDTH) / LCD_WIDTH);
+
+    for (i = 0; i < LCD_HEIGHT; i++)
+        scale_y[i] = (uint8_t)((i * GBA_LCD_HEIGHT) / LCD_HEIGHT);
+
+    frame_skip_counter = 0;
+
+    /* Clear to black and flush once to give a clean starting state. */
     rb->lcd_clear_display();
     rb->lcd_update();
+}
+
+/*
+ * blit_frame_c() — nearest-neighbour scale 240×160 GBA → 320×240 LCD, C impl.
+ *
+ * *** Phase 2b ARM assembly replacement target ***
+ *
+ * This function contains the entire inner blit loop.  When replacing with
+ * hand-written ARM asm, keep the signature and calling convention identical:
+ *   - src: pointer to 240×160 RGB565 pixels, row-major, stride=GBA_LCD_WIDTH
+ *   - dst: pointer to LCD framebuffer, row-major, stride=lcd_stride pixels
+ *   - scale_x[] and scale_y[] are module-level statics visible to the asm
+ *
+ * Constraints (must be preserved in the asm version):
+ *   - No floating point.
+ *   - No division.
+ *   - No branches inside the pixel-level inner loop.
+ *   - Both src and dst are 16-bit aligned; word/dword loads are safe.
+ */
+static void blit_frame_c(const uint16_t * restrict src,
+                          fb_data        * restrict dst)
+{
+    int dy, dx;
+
+    for (dy = 0; dy < LCD_HEIGHT; dy++) {
+        const uint16_t *src_row = src + (int)scale_y[dy] * GBA_LCD_WIDTH;
+        fb_data        *dst_row = dst + dy * lcd_stride;
+
+        for (dx = 0; dx < LCD_WIDTH; dx++)
+            dst_row[dx] = (fb_data)src_row[(int)scale_x[dx]];
+    }
 }
 
 void vid_update(const uint16_t *src)
 {
-    /* TODO Phase 2: scale 240×160 → 320×240 and blit to LCD.
-     *
-     * Nearest-neighbour integer scaler (no division in inner loop):
-     *
-     *   fb16_t *dst = rb->lcd_get_framebuffer(NULL, NULL);
-     *   int dst_stride = LCD_WIDTH;  // or from get_framebuffer stride param
-     *
-     *   for (int dy = 0; dy < LCD_HEIGHT; dy++) {
-     *       int sy = (dy * GBA_LCD_HEIGHT) / LCD_HEIGHT;  // pre-compute LUT
-     *       const uint16_t *src_row = src + sy * GBA_LCD_WIDTH;
-     *       fb16_t *dst_row = dst + dy * dst_stride;
-     *       for (int dx = 0; dx < LCD_WIDTH; dx++) {
-     *           int sx = (dx * GBA_LCD_WIDTH) / LCD_WIDTH;
-     *           dst_row[dx] = src_row[sx];
-     *       }
-     *   }
-     *   rb->lcd_update();
-     *
-     * Optimisation notes for Phase 3+:
-     *   - Pre-compute sx[] and sy[] lookup tables once in vid_init().
-     *   - Unroll inner loop with ARM NEON or at least 4-wide word copies.
-     *   - rb->lcd_update_rect(0, 0, LCD_WIDTH, LCD_HEIGHT) instead of full
-     *     lcd_update() if partial update is faster on S5L8702.
-     *   - Bilinear filter: average 2×2 GBA source pixels → 1 destination
-     *     pixel using fixed-point (avoids float on ARM926EJ-S which has no
-     *     FPU in hardware).
-     */
-    (void)src; /* stub: do nothing; placeholder screen remains visible */
+    /* Frameskip: skip blit + lcd_update on intermediate frames.
+     * The emulator core calls vid_update() every frame regardless. */
+    if (frameskip > 0) {
+        if (frame_skip_counter < frameskip) {
+            frame_skip_counter++;
+            return;
+        }
+        frame_skip_counter = 0;
+    }
+
+    blit_frame_c(src, lcd_framebuf);
+    rb->lcd_update();
 }
 
 void vid_exit(void)
 {
-    /* TODO Phase 2: restore any LCD state we changed in vid_init().
-     *   rb->lcd_set_viewport(NULL);  // restore default viewport
-     *   rb->lcd_set_backdrop(original_backdrop);
-     */
+    /* Restore default viewport, clear display. */
+    rb->lcd_set_viewport(NULL);
     rb->lcd_clear_display();
     rb->lcd_update();
+    lcd_framebuf = NULL;
 }
 
 /* =========================================================================
