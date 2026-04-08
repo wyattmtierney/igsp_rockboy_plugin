@@ -101,11 +101,14 @@ igsp_rockboy_plugin/
   - [x] `README.md` with port plan
 
 - [ ] **Phase 2 — Video**
-  - [ ] Obtain Rockbox framebuffer pointer via `rb->lcd_get_framebuffer()`
-  - [ ] Implement `vid_update()`: nearest-neighbour scale 240×160 → 320×240
-  - [ ] Direct framebuffer writes (bypass `lcd_bitmap()` overhead)
-  - [ ] `rb->lcd_update()` once per frame
-  - [ ] Pre-compute sx[]/sy[] lookup tables in `vid_init()`
+  - [x] Obtain Rockbox framebuffer pointer via `rb->lcd_get_framebuffer()`
+  - [x] Implement `vid_update()`: nearest-neighbour scale 240×160 → 320×240
+  - [x] Direct framebuffer writes (bypass `lcd_bitmap()` overhead)
+  - [x] `rb->lcd_update()` once per frame
+  - [x] Pre-compute sx[]/sy[] lookup tables in `vid_init()`
+  - [x] `blit_frame_c()` hot loop isolated — marked as Phase 2b ARM asm target
+  - [x] Frameskip support (`frameskip` + `frame_skip_counter`)
+  - [ ] Phase 2b: Replace `blit_frame_c()` with ARM asm inner loop
   - [ ] (Optional) Integer EPX / bilinear filter
 
 - [ ] **Phase 3 — Input**
