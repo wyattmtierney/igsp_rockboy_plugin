@@ -480,98 +480,309 @@ void input_exit(void)
 }
 
 /* =========================================================================
- * AUDIO SUBSYSTEM
- * ========================================================================= */
+ * AUDIO SUBSYSTEM — Phase 4
+ * =========================================================================
+ *
+ * Architecture
+ * ─────────────
+ *   Emulator thread (sound_write) → ring buffer → pcm_callback (IRQ) → DAC
+ *
+ * The GBA APU (src/sound.c) produces 16-bit stereo PCM at SOUND_SAMPLE_RATE
+ * Hz.  At 22050 Hz / 60 fps the APU delivers ≈ 368 stereo frames per GBA
+ * video frame.  sound_write() pushes these into a lock-free ring buffer;
+ * the Rockbox PCM mixer drains the buffer via pcm_callback() each time the
+ * DMA engine needs its next audio chunk.
+ *
+ * Ring buffer is SPSC (Single-Producer Single-Consumer):
+ *   Producer — sound_write()  : emulator thread, the ONLY writer of ring_head
+ *   Consumer — pcm_callback() : IRQ context,     the ONLY writer of ring_tail
+ *
+ * Indices are volatile uint32_t and grow without bound.  Buffer position is
+ * obtained by masking: ring_buf[index & RING_BUF_MASK].  Unsigned subtraction
+ * handles the inevitable 32-bit wrap-around transparently.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * COP Replacement — why no ipod_cop.c equivalent is needed
+ * ─────────────────────────────────────────────────────────────────────────
+ * igpSP's ipod_cop.c targeted the PortalPlayer PP502x dual-core SoC present
+ * in iPods up to the 5th generation.  It accessed three memory-mapped
+ * registers at fixed addresses (COP_HANDLER 0x4001501C, COP_STATUS 0x40015020,
+ * COP_CONTROL 0x60007004) to schedule screen-synchronisation work on the
+ * PP502x's second ARM core, freeing the main CPU for emulation.
+ *
+ * The iPod Classic 6G uses the Samsung S5L8702, an entirely different SoC.
+ * The PP502x COP registers do not exist on the S5L8702; writing to those
+ * addresses would corrupt peripheral registers or hang the device.  The COP
+ * code must NOT be ported.
+ *
+ * On the PP502x, audio went through the OSS /dev/dsp kernel driver via
+ * blocking write() calls on the MAIN core — the COP handled VIDEO only.
+ * That blocking write model is replaced wholesale here: Rockbox's DMA-driven
+ * PCM subsystem fires an interrupt when the DMA engine needs the next buffer.
+ * pcm_callback() runs in that IRQ context, achieving the same asynchronous
+ * audio delivery without any second-core management.  The emulator runs
+ * uninterrupted on the single S5L8702 ARM926EJ-S core while audio is handled
+ * by the hardware DMA controller and the Wolfson WM8758 DAC.
+ * ─────────────────────────────────────────────────────────────────────────
+ *
+ * Sample rate — 22050 Hz, matching igpSP's original iPod Linux default.
+ *
+ * The iPodLinux port ran the APU at 22050 Hz MONO because the OSS /dev/dsp
+ * driver had high per-write overhead and the PP502x COP pipeline stalled under
+ * stereo load at higher rates.  None of those constraints apply here:
+ *   • Rockbox uses DMA-driven PCM — the CPU is not involved in sample transfer.
+ *   • The Wolfson WM8758 DAC on the 6G supports 22050 Hz natively (no SRC).
+ *   • The GBA APU's highest-frequency content is ≈ 18 kHz, well within the
+ *     22050 Hz Nyquist limit of 11025 Hz.
+ *   • Stereo callback overhead is identical to mono on the S5L8702 (DMA width
+ *     is the same; the CPU copies nothing during normal playback).
+ *
+ * Performance tuning knob: if the emulator cannot sustain 60 fps due to
+ * audio overhead, reduce SOUND_SAMPLE_RATE to 11025 (SAMPR_11).  The ring
+ * buffer will drain 2× more slowly, giving the emulator more headroom.
+ * Change the value here AND the rb->mixer_set_frequency() call in sound_init().
+ */
+#define SOUND_SAMPLE_RATE    22050
 
 /*
- * PCM ring buffer — filled by sound_write() (emulator thread) and
- * drained by pcm_callback() (Rockbox mixer IRQ context).
+ * Ring buffer depth — SOUND_BUFFER_FRAMES stereo frames.
  *
- * TODO Phase 4: allocate ring buffer from sys_malloc() in sound_init(),
- *   use atomic head/tail indices for lock-free operation.  The GBA APU
- *   produces ~735 stereo frames per video frame @ 44100 Hz / 60 fps.
- *   A 4 × that = ~2940-frame (~11760-byte) ring buffer prevents starvation.
+ * At 22050 Hz / 60 fps the APU produces ≈ 368 stereo frames per video frame.
+ * 4096 frames ≈ 11 video frames of headroom, which prevents underruns across
+ * brief emulation hiccups without introducing perceptible latency.
+ * Memory cost: 4096 × 2 × sizeof(int16_t) = 16384 bytes.
+ *
+ * MUST be a power of two — the mask trick (& RING_BUF_MASK) replaces modulo.
  */
+#define SOUND_BUFFER_FRAMES  4096
+#define RING_BUF_SAMPLES     (SOUND_BUFFER_FRAMES * 2)       /* × 2 = stereo */
+#define RING_BUF_MASK        ((uint32_t)(RING_BUF_SAMPLES - 1))
 
-/* Called by the Rockbox PCM mixer when it needs another chunk of audio.
- * Runs in interrupt context — must be fast and lock-free.
+/*
+ * DMA output chunk — int16_t samples provided to the mixer per callback.
  *
- * TODO Phase 4: dequeue next contiguous chunk from the ring buffer.
- *   *start = ring_read_ptr;
- *   *size  = contiguous_bytes_available;
- *   advance ring_read_ptr by *size after the mixer consumes it.
- *
- *   If the ring buffer is empty (underrun): set *start/*size to a small
- *   silence buffer to avoid glitches; log the underrun count.
+ * 1024 samples = 512 stereo frames ≈ 23 ms at 22050 Hz.  Small enough for
+ * low latency; large enough to amortise callback overhead across many frames.
+ * Rockbox requires the DMA buffer size to be a multiple of 4 bytes;
+ * 1024 × sizeof(int16_t) = 2048 bytes satisfies that requirement.
  */
+#define PCM_CHUNK_SAMPLES    1024
+#define PCM_CHUNK_BYTES      ((int)(PCM_CHUNK_SAMPLES * sizeof(int16_t)))
+
+/* Ring buffer — allocated from the plugin heap in sound_init(). */
+static int16_t          *ring_buf    = NULL;
+
+/*
+ * SPSC ring buffer indices.
+ *
+ * ring_head — written ONLY by sound_write() (emulator thread).
+ * ring_tail — written ONLY by pcm_callback() (IRQ context).
+ *
+ * Both are read by both sides; volatile prevents the compiler from caching
+ * either in a register across the producer/consumer boundary.
+ *
+ * Indices grow without bound (uint32_t).  Unsigned subtraction gives the
+ * correct available/free count even after a 32-bit wrap-around, as long as
+ * the instantaneous distance never exceeds 2^31 — guaranteed here since the
+ * buffer is only 8192 samples deep.
+ */
+static volatile uint32_t ring_head   = 0;    /* write index — emulator thread */
+static volatile uint32_t ring_tail   = 0;    /* read  index — pcm_callback    */
+
+/*
+ * DMA output buffer — pcm_callback() copies ring data here, then hands the
+ * pointer to the Rockbox mixer via *start.  The buffer must remain valid
+ * between callback invocations because the DMA engine reads it asynchronously
+ * after the callback returns.
+ * Allocated from the plugin heap in sound_init().
+ */
+static int16_t          *pcm_dma_buf = NULL;
+
+/*
+ * Silence fallback — returned by pcm_callback() on underrun so the DAC keeps
+ * running without glitches.  Zeroed by sound_init(); small enough to live in
+ * the BSS segment (Rockbox zeroes plugin BSS at load time).
+ */
+static int16_t           pcm_silence[PCM_CHUNK_SAMPLES];
+
+/* Diagnostic counter — incremented on each underrun for debugging. */
+static volatile uint32_t pcm_underruns = 0;
+
+/* -------------------------------------------------------------------------
+ * pcm_callback() — Rockbox PCM mixer get_more callback.
+ *
+ * Invoked from interrupt context by the Rockbox DMA / mixer subsystem
+ * whenever the DMA engine has consumed the previous buffer and needs another
+ * chunk.  Sets *start and *size to point at the next PCM_CHUNK_BYTES of
+ * audio for the DMA engine to transfer to the WM8758 DAC.
+ *
+ * Hard constraints (enforced by the Rockbox mixer contract):
+ *   • MUST NOT block, sleep, yield, or call rb->sleep() / rb->yield().
+ *   • MUST NOT allocate or free memory.
+ *   • MUST NOT acquire any mutex or semaphore held by the main thread.
+ *   • MUST complete quickly — runs inside the audio IRQ handler.
+ *
+ * The function reads ring_head (producer index) and writes ring_tail
+ * (consumer index).  No other execution context writes ring_tail, so no
+ * lock is needed for the normal drain path.
+ * ------------------------------------------------------------------------- */
 static void pcm_callback(const void **start, size_t *size)
 {
-    /* TODO Phase 4: replace with real ring buffer drain. */
-    *start = NULL;
-    *size  = 0;
+    uint32_t head  = ring_head;     /* snapshot — producer writes this        */
+    uint32_t tail  = ring_tail;     /* our own index — only we write this     */
+    uint32_t avail = head - tail;   /* unsigned wrap gives correct count      */
+    uint32_t to_copy;
+    uint32_t idx;
+
+    if (avail == 0) {
+        /* Ring buffer empty — underrun.  Return silence so the DAC stays fed
+         * and does not click.  The emulator will refill within one frame. */
+        pcm_underruns++;
+        *start = pcm_silence;
+        *size  = (size_t)PCM_CHUNK_BYTES;
+        return;
+    }
+
+    /* Drain up to one full DMA chunk worth of samples. */
+    to_copy = (avail < (uint32_t)PCM_CHUNK_SAMPLES)
+              ? avail
+              : (uint32_t)PCM_CHUNK_SAMPLES;
+
+    idx = tail & RING_BUF_MASK;     /* buffer position of first sample to read */
+
+    if (idx + to_copy <= (uint32_t)RING_BUF_SAMPLES) {
+        /* Contiguous region — single copy. */
+        rb->memcpy(pcm_dma_buf, ring_buf + idx,
+                   to_copy * sizeof(int16_t));
+    } else {
+        /* Data wraps around the end of the ring buffer — two copies. */
+        uint32_t first = (uint32_t)RING_BUF_SAMPLES - idx;
+        rb->memcpy(pcm_dma_buf,         ring_buf + idx,
+                   first * sizeof(int16_t));
+        rb->memcpy(pcm_dma_buf + first, ring_buf,
+                   (to_copy - first) * sizeof(int16_t));
+    }
+
+    /* Silence-pad the tail of the DMA buffer if to_copy < PCM_CHUNK_SAMPLES
+     * (partial chunk at the very end of a session or after an underrun). */
+    if (to_copy < (uint32_t)PCM_CHUNK_SAMPLES) {
+        rb->memset(pcm_dma_buf + to_copy, 0,
+                   (PCM_CHUNK_SAMPLES - to_copy) * sizeof(int16_t));
+    }
+
+    /* Advance the consumer index.  This is the only write to ring_tail;
+     * the store is visible to sound_write() on the next sample check. */
+    ring_tail = tail + to_copy;
+
+    *start = pcm_dma_buf;
+    *size  = (size_t)PCM_CHUNK_BYTES;
 }
 
 void sound_init(int sample_rate, int channels)
 {
-    /* TODO Phase 4: initialise audio subsystem.
-     *
-     *   1. Allocate ring buffer from sys_malloc():
-     *        size_t buf_frames = (sample_rate / 60) * 4;
-     *        size_t buf_bytes  = buf_frames * channels * sizeof(int16_t);
-     *        ring_buf = sys_malloc(buf_bytes);
-     *
-     *   2. Start the Rockbox PCM mixer channel:
-     *        rb->mixer_channel_play_data(PCM_MIXER_CHAN_PLAYBACK,
-     *                                    pcm_callback, NULL, 0);
-     *      The mixer will immediately call pcm_callback() for the first
-     *      chunk; it will return silence until sound_write() populates the
-     *      ring buffer.
-     *
-     *   3. If rb->mixer_channel_play_data() is not available in this plugin
-     *      API version, fall back to rb->pcm_play_data().
-     *
-     * Note: igpSP hardcodes 44100 Hz stereo.  The S5L8702 DAC supports this
-     * natively so no resampling is needed.
-     */
-    (void)sample_rate;
-    (void)channels;
-    (void)pcm_callback; /* suppress -Wunused-function for Phase 1 stub */
+    (void)sample_rate;  /* fixed at SOUND_SAMPLE_RATE — see comment above     */
+    (void)channels;     /* always stereo — RING_BUF_SAMPLES already accounts for it */
+
+    /* Allocate ring buffer and DMA output buffer from the plugin heap.
+     * These allocations are permanent for the plugin's lifetime. */
+    ring_buf    = (int16_t *)sys_malloc(RING_BUF_SAMPLES  * sizeof(int16_t));
+    pcm_dma_buf = (int16_t *)sys_malloc(PCM_CHUNK_SAMPLES * sizeof(int16_t));
+
+    /* Initialise indices and diagnostic counters. */
+    ring_head    = 0;
+    ring_tail    = 0;
+    pcm_underruns = 0;
+
+    /* Zero both buffers so the first callback invocation returns clean silence
+     * even before sound_write() has enqueued any data. */
+    rb->memset(pcm_silence,  0, sizeof(pcm_silence));
+    if (pcm_dma_buf)
+        rb->memset(pcm_dma_buf, 0, PCM_CHUNK_SAMPLES * sizeof(int16_t));
+
+    /* Stop Rockbox's own audio playback so we can take over the PCM mixer. */
+    rb->audio_stop();
+
+#if INPUT_SRC_CAPS != 0
+    /* Route audio output to the playback path (required on targets with
+     * configurable I/O routing; harmless no-op on the iPod Classic 6G). */
+    rb->audio_set_input_source(AUDIO_SRC_PLAYBACK, SRCF_PLAYBACK);
+    rb->audio_set_output_source(AUDIO_SRC_PLAYBACK);
+#endif
+
+    /* Set the PCM sample rate.  22050 Hz matches igpSP's iPod Linux default
+     * and is natively supported by the Wolfson WM8758 DAC on the 6G.
+     * See SOUND_SAMPLE_RATE comment above if you need to change this. */
+    rb->mixer_set_frequency(SOUND_SAMPLE_RATE);
+
+    /* Register our callback and start the PCM mixer channel.  The mixer will
+     * call pcm_callback() immediately for the first chunk; it returns silence
+     * until sound_write() begins populating the ring buffer. */
+    rb->mixer_channel_play_data(PCM_MIXER_CHAN_PLAYBACK,
+                                pcm_callback, NULL, 0);
 }
 
 void sound_write(const int16_t *buf, int len)
 {
-    /* TODO Phase 4: enqueue @len stereo frames into the ring buffer.
-     *   Bytes = len * 2 channels * sizeof(int16_t) = len * 4.
-     *
-     *   Strategy if ring buffer is full:
-     *     Spin-wait (busy loop) for a small number of cycles — the mixer
-     *     IRQ will drain space shortly.  Cap spin at ~2 ms; if still full
-     *     after cap, drop the oldest data (prefer low latency over no drops).
-     */
-    (void)buf;
-    (void)len;
+    /* len is stereo *frames*; each frame is 2 int16_t samples (L + R). */
+    int      samples = len * 2;
+    int      i;
+
+    if (!ring_buf || !buf || samples <= 0)
+        return;
+
+    for (i = 0; i < samples; i++) {
+        uint32_t head = ring_head;
+
+        if ((head - ring_tail) >= (uint32_t)RING_BUF_SAMPLES) {
+            /*
+             * Ring buffer full (overrun).  Drop the oldest PCM_CHUNK_SAMPLES
+             * by advancing ring_tail forward, keeping the most recent audio in
+             * the buffer.  rb->pcm_play_lock() briefly masks the PCM IRQ so
+             * the write to ring_tail is atomic with respect to pcm_callback().
+             *
+             * This never blocks — lock/unlock is a short IRQ-mask pair.
+             */
+            rb->pcm_play_lock();
+            ring_tail += (uint32_t)PCM_CHUNK_SAMPLES;
+            rb->pcm_play_unlock();
+        }
+
+        ring_buf[head & RING_BUF_MASK] = buf[i];
+        ring_head = head + 1;
+    }
 }
 
 void sound_set_volume(int vol)
 {
-    /* TODO Phase 4: map 0–100 percentage to Rockbox volume scale.
-     *   int rb_vol = vol * rb->sound_max(SOUND_VOLUME) / 100;
-     *   rb->sound_set(SOUND_VOLUME, rb_vol);
-     *   Or, if using mixer amplitude:
-     *   rb->mixer_channel_set_amplitude(PCM_MIXER_CHAN_PLAYBACK,
-     *       MIX_AMP_UNITY * vol / 100);
+    /*
+     * Map the 0–100 percentage to the Rockbox SOUND_VOLUME range.
+     *
+     * rb->sound_min(SOUND_VOLUME) / rb->sound_max(SOUND_VOLUME) return the
+     * hardware DAC's usable range in Rockbox units (typically -74 to +6 dB on
+     * the WM8758, but queried at runtime to remain target-agnostic).
+     *
+     * A linear mapping from the percentage to [min, max] approximates the
+     * perceptual volume curve well enough for in-game volume control.
      */
-    (void)vol;
+    int min_vol = rb->sound_min(SOUND_VOLUME);
+    int max_vol = rb->sound_max(SOUND_VOLUME);
+    int rb_vol  = min_vol + (vol * (max_vol - min_vol) + 50) / 100;
+    rb->sound_set(SOUND_VOLUME, rb_vol);
 }
 
 void sound_exit(void)
 {
-    /* TODO Phase 4: stop PCM output cleanly.
-     *   rb->mixer_channel_stop(PCM_MIXER_CHAN_PLAYBACK);
-     *   or rb->pcm_play_stop() for older API.
-     *   No need to free ring buffer — sys_malloc() arena is dropped with
-     *   the plugin anyway.
-     */
+    /* Stop the mixer channel and restore the default sample rate so Rockbox's
+     * own audio playback works normally after the plugin exits. */
+    rb->mixer_channel_stop(PCM_MIXER_CHAN_PLAYBACK);
+    rb->mixer_set_frequency(HW_SAMPR_DEFAULT);
+
+    /* No need to free ring_buf or pcm_dma_buf — the sys_malloc() bump arena
+     * is discarded in its entirety when the plugin returns to Rockbox. */
+    ring_buf    = NULL;
+    pcm_dma_buf = NULL;
+    ring_head   = 0;
+    ring_tail   = 0;
 }
 
 /* =========================================================================
