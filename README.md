@@ -119,11 +119,15 @@ igsp_rockboy_plugin/
   - [x] Quit sets `exit_requested = true`; emulator main loop exits cleanly
   - [x] `input_read_keys()` returns active-low GBA KEYINPUT format (0x3FF = all released)
 
-- [ ] **Phase 4 — Audio**
-  - [ ] Allocate lock-free PCM ring buffer from plugin heap
-  - [ ] Implement `pcm_callback()` for `rb->mixer_channel_play_data()`
-  - [ ] Implement `sound_write()` ring buffer enqueue
-  - [ ] Tune ring buffer depth for 60 fps / 44100 Hz (≈ 735 frames/chunk)
+- [x] **Phase 4 — Audio**
+  - [x] Allocate lock-free SPSC ring buffer from plugin heap (`sys_malloc`)
+  - [x] `pcm_callback()` drains ring buffer; returns silence on underrun
+  - [x] `sound_write()` enqueues stereo frames; drops oldest on overrun (non-blocking)
+  - [x] `sound_init()` sets 22050 Hz via `rb->mixer_set_frequency()`, starts `PCM_MIXER_CHAN_PLAYBACK`
+  - [x] `sound_set_volume()` maps 0–100 → `SOUND_VOLUME` range via `rb->sound_set()`
+  - [x] `sound_exit()` stops mixer channel, restores `HW_SAMPR_DEFAULT`
+  - [x] COP replacement documented — PP502x registers absent on S5L8702; Rockbox DMA IRQ covers the same role
+  - [x] Ring buffer depth: 4096 stereo frames (≈ 11 video frames @ 22050 Hz / 60 fps)
 
 - [ ] **Phase 5 — CPU Core Integration**
   - [ ] Copy igpSP `src/` files into repo
