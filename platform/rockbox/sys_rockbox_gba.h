@@ -334,4 +334,26 @@ void *sys_malloc(size_t size);
  */
 size_t sys_heap_remaining(void);
 
+/* =========================================================================
+ * PHASE 6 API
+ * ========================================================================= */
+
+/**
+ * igpsp_phase6_init() — post-ROM-load Phase 6 initialisation.
+ * @param rom_path  Absolute path of the loaded ROM (.gba or .zip).
+ *
+ * Must be called from igpsp.c immediately after load_gamepak() returns 0.
+ * Derives the ROM basename, overrides backup_filename to /gba/<rom>.sav,
+ * loads SRAM from /gba/, loads cheats from /gba/<rom>.cht if present,
+ * applies initial volume, and seeds the frame limiter.
+ */
+void igpsp_phase6_init(const char *rom_path);
+
+/**
+ * igpsp_sram_flush() — write SRAM to /gba/<rom>.sav if dirty.
+ * Safe to call at any time; no-op if backup_update == 0 or no ROM loaded.
+ * Called automatically on clean exit (Quit menu item) and on save state.
+ */
+void igpsp_sram_flush(void);
+
 #endif /* SYS_ROCKBOX_GBA_H */

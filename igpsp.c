@@ -307,15 +307,44 @@ enum plugin_status plugin_start(const void *parameter)
 
     /* ------------------------------------------------------------------
      * 12. Load ROM — fail fast on error.
+     *
      * load_gamepak() reads the ROM header, detects save type, loads
      * cheats if a .cht file exists, and fills gamepak_rom[].
+     * For .zip paths, igpSP's load_gamepak() calls load_file_zip()
+     * internally to decompress the first .gba entry into gamepak_rom[].
      * Returns 0 on success, non-zero (-1) on failure.
      * ------------------------------------------------------------------ */
     if (load_gamepak((char *)rom_path) != 0) {
-        rb->splashf(HZ * 3,
-                    "igpSP: Failed to load ROM:\n%s", rom_path);
+        /* Provide a more specific error for ZIP files. */
+        {
+            size_t plen = strlen(rom_path);
+            int is_zip = (plen > 4 &&
+                          rom_path[plen-4] == '.' &&
+                          (rom_path[plen-3] == 'z' || rom_path[plen-3] == 'Z') &&
+                          (rom_path[plen-2] == 'i' || rom_path[plen-2] == 'I') &&
+                          (rom_path[plen-1] == 'p' || rom_path[plen-1] == 'P'));
+            if (is_zip)
+                rb->splashf(HZ * 3,
+                            "igpSP: No .gba found in ZIP:\n%s", rom_path);
+            else
+                rb->splashf(HZ * 3,
+                            "igpSP: Failed to load ROM:\n%s", rom_path);
+        }
         goto err_cleanup;
     }
+
+    /* ------------------------------------------------------------------
+     * 12b. Phase 6 post-ROM-load init.
+     *
+     * igpsp_phase6_init() must be called after load_gamepak() succeeds:
+     *   • Derives the ROM basename for save-state / SRAM / cheat paths.
+     *   • Overrides backup_filename to /gba/<rom>.sav.
+     *   • Loads SRAM from /gba/<rom>.sav (preferred location).
+     *   • Loads cheats from /gba/<rom>.cht if present.
+     *   • Applies initial volume setting.
+     *   • Seeds the frame rate limiter.
+     * ------------------------------------------------------------------ */
+    igpsp_phase6_init(rom_path);
 
     /* ------------------------------------------------------------------
      * 13–14. CPU and memory map init.
