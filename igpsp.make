@@ -73,10 +73,7 @@ IGPSP_SRC := \
 # input.c is intentionally omitted: our ipod_* hooks in sys_rockbox_gba.c
 # provide all input functionality, replacing the iPod Linux input module.
 #
-# Phase 6 extras (optional — uncomment when ready):
-#	$(IGPSP_SRCDIR)/src/cheats.c
-#	$(IGPSP_SRCDIR)/src/zip.c
-#	$(IGPSP_SRCDIR)/src/gui.c
+# gui.c is not used — igpSP's GUI is replaced by our Rockbox in-game menu.
 # ─────────────────────────────────────────────────────────────────────────────
 IGPSP_CORE_SRC := \
 	$(IGPSP_SRCDIR)/src/main.c \
@@ -84,7 +81,9 @@ IGPSP_CORE_SRC := \
 	$(IGPSP_SRCDIR)/src/cpu_threaded.c \
 	$(IGPSP_SRCDIR)/src/memory.c \
 	$(IGPSP_SRCDIR)/src/video.c \
-	$(IGPSP_SRCDIR)/src/sound.c
+	$(IGPSP_SRCDIR)/src/sound.c \
+	$(IGPSP_SRCDIR)/src/cheats.c \
+	$(IGPSP_SRCDIR)/src/zip.c
 
 IGPSP_OBJ := \
 	$(patsubst $(IGPSP_SRCDIR)/%.c, $(IGPSP_OBJDIR)/%.o, $(IGPSP_SRC)) \

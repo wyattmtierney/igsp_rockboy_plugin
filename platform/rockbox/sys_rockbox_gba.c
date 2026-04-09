@@ -312,50 +312,9 @@ static int wheel_pos_to_zone(int pos)
 }
 
 /* -------------------------------------------------------------------------
- * show_ingame_menu() — pause emulation and present the in-game menu.
- *
- * Uses Rockbox's MENUITEM_STRINGLIST / rb->do_menu() API (same approach
- * Rockboy uses via do_user_menu()).  On Quit, sets exit_requested = true.
- *
- * Wheel events are re-enabled for menu navigation and suppressed again
- * when control returns to the emulator loop.
+ * show_ingame_menu() — forward declaration; defined in Phase 6 section.
  * ------------------------------------------------------------------------- */
-MENUITEM_STRINGLIST(ingame_menu_ex, "igpSP Menu", NULL,
-    "Resume", "Save State", "Load State", "Quit");
-
-static void show_ingame_menu(void)
-{
-    int sel    = 0;
-    int result;
-
-#ifdef HAVE_WHEEL_POSITION
-    /* Allow the wheel to generate button-queue events for menu navigation. */
-    rb->wheel_send_events(true);
-#endif
-
-    result = rb->do_menu(&ingame_menu_ex, &sel, NULL, false);
-
-#ifdef HAVE_WHEEL_POSITION
-    /* Back to absolute-position polling; suppress queue events. */
-    rb->wheel_send_events(false);
-#endif
-
-    switch (result) {
-        case 0: /* Resume — return to emulator immediately */
-            break;
-        case 1: /* Save State — Phase 6 */
-            rb->splash(HZ, "Save State: coming in Phase 6");
-            break;
-        case 2: /* Load State — Phase 6 */
-            rb->splash(HZ, "Load State: coming in Phase 6");
-            break;
-        case 3: /* Quit — signal the emulator main loop to exit */
-            exit_requested = true;
-            break;
-        default: /* BACK / MENU pressed — treat as Resume */
-            break;
-    }
-}
+static void show_ingame_menu(void);
 
 /* -------------------------------------------------------------------------
  * input_init() — initialise the input subsystem.
@@ -1137,7 +1096,8 @@ void ipod_init_conf(void)
 /** ipod_exit_conf() — save persistent configuration on exit. */
 void ipod_exit_conf(void)
 {
-    /* Phase 6: write settings to /.rockbox/igpsp/igpsp.cfg */
+    /* Flush SRAM to /gba/<rom>.sav on clean exit. */
+    igpsp_sram_flush();
 }
 
 /** ipod_init_hw() — hardware video initialisation.
@@ -1265,6 +1225,9 @@ int ipod_update_menu_input(void)
 
 /* ── Screen output ────────────────────────────────────────────────────── */
 
+/* Forward declaration — p6_frame_limiter() is defined in the Phase 6 section. */
+static void p6_frame_limiter(void);
+
 /**
  * update_screen() — push the completed GBA frame to the Rockbox LCD.
  *
@@ -1282,6 +1245,9 @@ void update_screen(void)
      * We extern it here; it is set up by igpSP's init_video(). */
     extern uint16_t *screen;
     vid_update(screen);
+
+    /* Phase 6: frame rate limiter — cap to ~60 fps, manage auto-frameskip. */
+    p6_frame_limiter();
 }
 
 /* ── Timing ───────────────────────────────────────────────────────────── */
@@ -1322,6 +1288,667 @@ void print_string(const char *str, uint32_t fg, uint32_t bg,
 {
     (void)str; (void)fg; (void)bg; (void)x; (void)y;
     /* Phase 6: optionally render debug overlay via rb->lcd_putsxy() */
+}
+
+/* =========================================================================
+ * PHASE 6 — SAVE STATES · SRAM · FRAME LIMITER · IN-GAME MENU · CHEATS
+ * =========================================================================
+ *
+ * This section is entirely self-contained.  It externs the igpSP memory
+ * regions and backup API, then builds the full in-game menu on top.
+ *
+ * Directory convention:  /gba/<rom_basename>.<ext>
+ *   .ss0 – .ss4  save states
+ *   .sav         SRAM battery save (also written by igpSP automatically)
+ *   .cht         cheat codes (authored externally, loaded on ROM load)
+ * ========================================================================= */
+
+/* ── Save state header ───────────────────────────────────────────────────── */
+#define GBA_SAVE_DIR     "/gba"
+#define SS_MAGIC         "IGSS"
+#define SS_VERSION       ((uint16_t)1u)
+/* Header layout: magic(4) + version(2) + timestamp_str(20) = 26 bytes.
+ * timestamp_str is "YYYY-MM-DD HH:MM:SS" NUL-terminated, written at save. */
+#define SS_HDR_TOTAL     26u
+#define SS_TSTAMP_LEN    20u   /* including NUL */
+
+/* GBA memory region sizes used by the serialiser. */
+#define P6_EWRAM_SZ   (256u * 1024u)
+#define P6_IWRAM_SZ   ( 32u * 1024u)
+#define P6_VRAM_SZ    ( 96u * 1024u)
+#define P6_OAM_SZ     (512u * 2u)       /* 512 × uint16_t = 1024 bytes      */
+#define P6_PAL_SZ     (512u * 2u)
+#define P6_IOREG_SZ   (512u * 4u)       /* 512 × uint32_t I/O registers     */
+#define P6_CPU_SZ     ( 64u * 4u)       /* 64  × uint32_t ARM register bank */
+
+/* ── igpSP memory region externs (memory.c) ─────────────────────────────── */
+extern uint8_t  ewram[];
+extern uint8_t  iwram[];
+extern uint8_t  vram[];
+extern uint16_t oam_data[];
+extern uint16_t palette_ram[];
+extern uint32_t io_registers[];
+/* ARM register file (cpu_threaded.c / cpu.c) — at least 64 uint32_t entries */
+extern uint32_t reg[];
+
+/* ── igpSP backup/SRAM API (memory.c) ───────────────────────────────────── */
+extern uint32_t load_backup(char *name);
+extern uint32_t save_backup(char *name);
+extern uint32_t backup_update;          /* nonzero = SRAM has been written   */
+extern char     backup_filename[512];   /* path igpSP uses for periodic saves */
+
+/* ── igpSP cheat engine (cheats.c) ──────────────────────────────────────── */
+/* Minimal struct view that matches igpSP's cheat_type layout.
+ * Fields: cheat_type_code(4) cheat_active(4) cheat_address(4) cheat_value(2)
+ *         _pad(2) cheat_master_code(4) cheat_hook(4) cheat_name[64]
+ * Total: 88 bytes.  Must stay in sync with igpSP's common.h cheat_type. */
+typedef struct {
+    uint32_t cheat_type_code;    /* GS/AR variant                           */
+    uint32_t cheat_active;       /* 1 = enabled, 0 = disabled               */
+    uint32_t cheat_address;
+    uint16_t cheat_value;
+    uint16_t _pad0;
+    uint32_t cheat_master_code;
+    uint32_t cheat_hook;
+    char     cheat_name[64];
+} igpsp_cheat_view_t;
+
+#define IGPSP_MAX_CHEATS  16
+extern igpsp_cheat_view_t cheats[];
+extern uint32_t           num_cheats;
+extern void               add_cheats(uint8_t *filename);
+
+/* ── Phase 6 state ───────────────────────────────────────────────────────── */
+static char p6_rom_basename[256];       /* stem of the loaded ROM filename   */
+static char p6_slot_labels[5][64];      /* slot label strings for the UI     */
+static int  p6_volume     = 75;         /* 0–100                             */
+static int  p6_frameskip  = 0;          /* 0 = auto, 1–4 = fixed skip count  */
+
+/* Frame timing for auto-frameskip */
+#define P6_FRAME_HIST   10
+static uint32_t p6_frame_start = 0;     /* sys_get_ticks() at frame start    */
+static uint32_t p6_frame_ms[P6_FRAME_HIST];
+static int      p6_frame_idx = 0;
+static bool     p6_auto_skip = false;
+
+/* ── Path utilities ──────────────────────────────────────────────────────── */
+
+/** ensure_gba_dir() — create /gba if absent. */
+static void ensure_gba_dir(void)
+{
+    int fd = rb->open(GBA_SAVE_DIR, O_RDONLY, 0);
+    if (fd >= 0) { rb->close(fd); return; }
+    rb->mkdir(GBA_SAVE_DIR);
+}
+
+static void build_slot_path(char *buf, size_t sz, int slot)
+{
+    rb->snprintf(buf, sz, GBA_SAVE_DIR "/%s.ss%d", p6_rom_basename, slot);
+}
+
+static void build_sav_path(char *buf, size_t sz)
+{
+    rb->snprintf(buf, sz, GBA_SAVE_DIR "/%s.sav", p6_rom_basename);
+}
+
+static void build_cht_path(char *buf, size_t sz)
+{
+    rb->snprintf(buf, sz, GBA_SAVE_DIR "/%s.cht", p6_rom_basename);
+}
+
+/* ── Save state helpers ──────────────────────────────────────────────────── */
+
+/** p6_slot_timestamp() — fill buf with the slot's "YYYY-MM-DD HH:MM:SS"
+ *  string (from the header), or "Empty" if the file doesn't exist or has
+ *  a bad magic.  Returns true if the slot is occupied. */
+static bool p6_slot_timestamp(int slot, char *buf, size_t bufsz)
+{
+    char path[512];
+    char header[SS_HDR_TOTAL];
+    int  fd;
+    int  n;
+
+    build_slot_path(path, sizeof(path), slot);
+    fd = rb->open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        rb->snprintf(buf, bufsz, "Empty");
+        return false;
+    }
+    n = rb->read(fd, header, SS_HDR_TOTAL);
+    rb->close(fd);
+
+    if (n < (int)SS_HDR_TOTAL || memcmp(header, SS_MAGIC, 4) != 0) {
+        rb->snprintf(buf, bufsz, "Empty");
+        return false;
+    }
+    /* timestamp string starts at offset 6 */
+    rb->snprintf(buf, bufsz, "%.19s", header + 6);
+    return true;
+}
+
+/** p6_update_slot_labels() — refresh p6_slot_labels[0..4] before showing
+ *  the save/load submenu. */
+static void p6_update_slot_labels(void)
+{
+    int i;
+    char ts[SS_TSTAMP_LEN + 4];
+
+    for (i = 0; i < 5; i++) {
+        p6_slot_timestamp(i, ts, sizeof(ts));
+        rb->snprintf(p6_slot_labels[i], sizeof(p6_slot_labels[i]),
+                     "Slot %d: %s", i, ts);
+    }
+}
+
+/* Write helper that flushes one region; returns false on error. */
+static bool p6_write_region(int fd, const void *buf, size_t sz)
+{
+    return (size_t)rb->write(fd, buf, sz) == sz;
+}
+
+/** p6_save_state() — serialise emulator snapshot to /gba/<rom>.ssN.
+ *
+ *  Format:
+ *    "IGSS"     (4 bytes magic)
+ *    uint16_t   (2 bytes version = 1)
+ *    char[20]   (timestamp "YYYY-MM-DD HH:MM:SS\0")
+ *    ewram      (256 KB)
+ *    iwram      ( 32 KB)
+ *    vram       ( 96 KB)
+ *    oam_data   (  1 KB)
+ *    palette_ram(  1 KB)
+ *    io_registers (2 KB)
+ *    reg[]      (256 bytes — 64 × uint32_t ARM register bank)
+ */
+static void p6_save_state(int slot)
+{
+    char path[512];
+    int  fd;
+    char hdr[SS_HDR_TOTAL];
+    uint16_t ver = SS_VERSION;
+
+    ensure_gba_dir();
+    build_slot_path(path, sizeof(path), slot);
+
+    /* Pause PCM output while writing so the callback never races the disk I/O. */
+    rb->pcm_play_lock();
+
+    fd = rb->open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        rb->pcm_play_unlock();
+        rb->splashf(HZ * 2, "Save failed: can't open slot %d", slot);
+        return;
+    }
+
+    /* Build header. */
+    memcpy(hdr, SS_MAGIC, 4);
+    memcpy(hdr + 4, &ver, 2);
+
+    /* Timestamp string. */
+    {
+        struct tm *t = rb->get_time();
+        if (t) {
+            rb->snprintf(hdr + 6, SS_TSTAMP_LEN,
+                         "%04d-%02d-%02d %02d:%02d:%02d",
+                         t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+                         t->tm_hour,        t->tm_min,     t->tm_sec);
+        } else {
+            rb->snprintf(hdr + 6, SS_TSTAMP_LEN, "0000-00-00 00:00:00");
+        }
+    }
+    rb->write(fd, hdr, SS_HDR_TOTAL);
+
+    /* Serialise GBA memory regions. */
+    p6_write_region(fd, ewram,        P6_EWRAM_SZ);
+    p6_write_region(fd, iwram,        P6_IWRAM_SZ);
+    p6_write_region(fd, vram,         P6_VRAM_SZ);
+    p6_write_region(fd, oam_data,     P6_OAM_SZ);
+    p6_write_region(fd, palette_ram,  P6_PAL_SZ);
+    p6_write_region(fd, io_registers, P6_IOREG_SZ);
+    p6_write_region(fd, reg,          P6_CPU_SZ);
+
+    rb->close(fd);
+    rb->pcm_play_unlock();
+
+    /* Also flush SRAM so the battery save is current. */
+    if (p6_rom_basename[0] != '\0') {
+        char sav[512];
+        build_sav_path(sav, sizeof(sav));
+        save_backup(sav);
+    }
+
+    rb->splashf(HZ + HZ / 2, "State saved — slot %d", slot);
+}
+
+/** p6_load_state() — deserialise snapshot from /gba/<rom>.ssN. */
+static void p6_load_state(int slot)
+{
+    char     path[512];
+    int      fd;
+    char     hdr[SS_HDR_TOTAL];
+    uint16_t ver;
+
+    build_slot_path(path, sizeof(path), slot);
+    fd = rb->open(path, O_RDONLY, 0);
+    if (fd < 0) {
+        rb->splashf(HZ * 2, "Slot %d is empty", slot);
+        return;
+    }
+
+    if (rb->read(fd, hdr, SS_HDR_TOTAL) < (int)SS_HDR_TOTAL ||
+        memcmp(hdr, SS_MAGIC, 4) != 0) {
+        rb->close(fd);
+        rb->splashf(HZ * 2, "Slot %d: bad save file", slot);
+        return;
+    }
+    memcpy(&ver, hdr + 4, 2);
+    if (ver != SS_VERSION) {
+        rb->close(fd);
+        rb->splashf(HZ * 2, "Slot %d: incompatible format (v%u)", slot, (unsigned)ver);
+        return;
+    }
+
+    /* Pause PCM output during deserialisation. */
+    rb->pcm_play_lock();
+
+    rb->read(fd, ewram,        P6_EWRAM_SZ);
+    rb->read(fd, iwram,        P6_IWRAM_SZ);
+    rb->read(fd, vram,         P6_VRAM_SZ);
+    rb->read(fd, oam_data,     P6_OAM_SZ);
+    rb->read(fd, palette_ram,  P6_PAL_SZ);
+    rb->read(fd, io_registers, P6_IOREG_SZ);
+    rb->read(fd, reg,          P6_CPU_SZ);
+
+    rb->close(fd);
+    rb->pcm_play_unlock();
+
+    rb->splashf(HZ, "State loaded — slot %d", slot);
+}
+
+/* ── SRAM helpers ────────────────────────────────────────────────────────── */
+
+/** igpsp_sram_flush() — write gamepak_backup to /gba/<rom>.sav if dirty.
+ *  Also updates backup_filename so igpSP's own periodic write uses our path.
+ *  Safe to call multiple times; no-op if backup_update == 0. */
+void igpsp_sram_flush(void)
+{
+    char sav[512];
+
+    if (p6_rom_basename[0] == '\0')
+        return;   /* no ROM loaded */
+    if (backup_update == 0)
+        return;   /* not dirty */
+
+    ensure_gba_dir();
+    build_sav_path(sav, sizeof(sav));
+    save_backup(sav);
+}
+
+/* ── Frame rate limiter ──────────────────────────────────────────────────── */
+/* Target: 59.7275 fps → ~16.74 ms per frame.
+ * Rockbox ticks are 10 ms; we track tick deltas and sleep if ahead.
+ *
+ * Called from update_screen() at the END of each rendered frame.
+ *
+ * Auto-frameskip (p6_frameskip == 0):
+ *   If the last P6_FRAME_HIST frames average > 20 ms each, enable 1-frame
+ *   skip (frameskip = 1) to give the emulator breathing room.
+ *   When frames recover to < 14 ms average, restore frameskip = 0.
+ *
+ * Fixed frameskip (p6_frameskip 1–4):
+ *   Writes the value directly to the module-level `frameskip` variable
+ *   consumed by vid_update().
+ */
+static void p6_frame_limiter(void)
+{
+    uint32_t now_tick = sys_get_ticks();
+    uint32_t elapsed_ticks;
+    uint32_t elapsed_ms;
+    uint32_t avg_ms;
+    int      i;
+    uint32_t sum;
+
+    /* Compute elapsed time for this frame. */
+    elapsed_ticks = now_tick - p6_frame_start;
+    elapsed_ms    = elapsed_ticks * 10u;   /* Rockbox: 1 tick = 10 ms */
+
+    /* Record into history ring. */
+    p6_frame_ms[p6_frame_idx] = elapsed_ms;
+    p6_frame_idx = (p6_frame_idx + 1) % P6_FRAME_HIST;
+
+    /* Compute average over history window. */
+    sum = 0;
+    for (i = 0; i < P6_FRAME_HIST; i++)
+        sum += p6_frame_ms[i];
+    avg_ms = sum / P6_FRAME_HIST;
+
+    /* Apply frameskip setting. */
+    if (p6_frameskip == 0) {
+        /* Auto mode: adapt based on average frame time. */
+        if (avg_ms > 20u && !p6_auto_skip) {
+            p6_auto_skip = true;
+            frameskip    = 1;
+        } else if (avg_ms < 14u && p6_auto_skip) {
+            p6_auto_skip = false;
+            frameskip    = 0;
+        }
+    } else {
+        /* Fixed mode: honour the menu setting. */
+        frameskip    = p6_frameskip;
+        p6_auto_skip = false;
+    }
+
+    /* Sleep the remaining frame budget if we finished early.
+     * Budget ≈ 16 ms; we sleep 1 tick (10 ms) if elapsed < 10 ms.
+     * Tick resolution means we only sleep when clearly ahead.
+     * If elapsed >= budget, skip sleep entirely — don't accumulate debt. */
+    if (elapsed_ms < 10u)
+        rb->sleep(1);
+
+    /* Record start tick for NEXT frame. */
+    p6_frame_start = sys_get_ticks();
+}
+
+/* ── Cheat toggle submenu ────────────────────────────────────────────────── */
+
+/* Label builder — refreshed each time a cheat is toggled. */
+static void p6_build_cheat_labels(char lbl[][72], int count)
+{
+    int i;
+    for (i = 0; i < IGPSP_MAX_CHEATS; i++) {
+        if (i < count) {
+            rb->snprintf(lbl[i], 72, "[%s] %.55s",
+                         cheats[i].cheat_active ? "ON " : "OFF",
+                         cheats[i].cheat_name[0]
+                             ? cheats[i].cheat_name : "(unnamed)");
+        } else {
+            rb->snprintf(lbl[i], 72, "(unused)");
+        }
+    }
+}
+
+static void show_cheats_menu(void)
+{
+    static char clabels[IGPSP_MAX_CHEATS][72];
+    int nc, sel, result;
+
+    nc = (int)num_cheats;
+    if (nc > IGPSP_MAX_CHEATS) nc = IGPSP_MAX_CHEATS;
+
+    if (nc == 0) {
+        rb->splash(HZ * 2, "No cheats loaded");
+        return;
+    }
+
+    /* Show all IGPSP_MAX_CHEATS slots; empty ones labelled "(unused)".
+     * Selecting an "(unused)" slot is a no-op so UX degrades gracefully. */
+    p6_build_cheat_labels(clabels, nc);
+
+    sel = 0;
+    do {
+        MENUITEM_STRINGLIST(cheat_menu, "Cheats — select to toggle", NULL,
+            clabels[0],  clabels[1],  clabels[2],  clabels[3],
+            clabels[4],  clabels[5],  clabels[6],  clabels[7],
+            clabels[8],  clabels[9],  clabels[10], clabels[11],
+            clabels[12], clabels[13], clabels[14], clabels[15]);
+
+        result = rb->do_menu(&cheat_menu, &sel, NULL, false);
+        if (result < 0)
+            break;          /* BACK / MENU — exit cheats menu */
+        if (result >= nc)
+            break;          /* selected an unused slot — exit */
+
+        /* Toggle. */
+        cheats[result].cheat_active ^= 1u;
+        /* Refresh just the changed label. */
+        rb->snprintf(clabels[result], 72, "[%s] %.55s",
+                     cheats[result].cheat_active ? "ON " : "OFF",
+                     cheats[result].cheat_name[0]
+                         ? cheats[result].cheat_name : "(unnamed)");
+        /* Loop to show updated menu. */
+    } while (1);
+}
+
+/* ── Save / load state submenus ─────────────────────────────────────────── */
+static void show_save_submenu(void)
+{
+    int sel = 0, result;
+    p6_update_slot_labels();
+    MENUITEM_STRINGLIST(save_menu, "Save State", NULL,
+        p6_slot_labels[0], p6_slot_labels[1], p6_slot_labels[2],
+        p6_slot_labels[3], p6_slot_labels[4]);
+    result = rb->do_menu(&save_menu, &sel, NULL, false);
+    if (result >= 0 && result <= 4)
+        p6_save_state(result);
+}
+
+static void show_load_submenu(void)
+{
+    int  sel = 0, result, i;
+    char ts[SS_TSTAMP_LEN + 4];
+    bool occupied[5];
+
+    p6_update_slot_labels();
+
+    /* Check which slots are occupied. */
+    for (i = 0; i < 5; i++) {
+        occupied[i] = p6_slot_timestamp(i, ts, sizeof(ts));
+        /* Grey-out label for empty slots via "(empty)" suffix — actual grey-out
+         * requires the settings API; we indicate emptiness via the label text. */
+        if (!occupied[i])
+            rb->snprintf(p6_slot_labels[i], sizeof(p6_slot_labels[i]),
+                         "Slot %d: (empty)", i);
+    }
+
+    MENUITEM_STRINGLIST(load_menu, "Load State", NULL,
+        p6_slot_labels[0], p6_slot_labels[1], p6_slot_labels[2],
+        p6_slot_labels[3], p6_slot_labels[4]);
+
+    result = rb->do_menu(&load_menu, &sel, NULL, false);
+    if (result >= 0 && result <= 4) {
+        if (!occupied[result])
+            rb->splashf(HZ * 2, "Slot %d is empty", result);
+        else
+            p6_load_state(result);
+    }
+}
+
+/* ── Volume and frameskip submenus ──────────────────────────────────────── */
+static void show_volume_menu(void)
+{
+    static const int voldelta[] = { -10, -5, -1, 0, 1, 5, 10 };
+    int  sel = 3, result;  /* default selection = "(current)" */
+    char title[32];
+
+    rb->snprintf(title, sizeof(title), "Volume: %d%%", p6_volume);
+
+    MENUITEM_STRINGLIST(vol_menu, title, NULL,
+        "-10%", "-5%", "-1%", "(current)", "+1%", "+5%", "+10%");
+
+    result = rb->do_menu(&vol_menu, &sel, NULL, false);
+    if (result >= 0 && result <= 6) {
+        p6_volume += voldelta[result];
+        if (p6_volume < 0)   p6_volume = 0;
+        if (p6_volume > 100) p6_volume = 100;
+        sound_set_volume(p6_volume);
+    }
+}
+
+static void show_frameskip_menu(void)
+{
+    int sel = p6_frameskip, result;
+    MENUITEM_STRINGLIST(fs_menu, "Frameskip", NULL,
+        "0 — Auto", "1", "2", "3", "4");
+    result = rb->do_menu(&fs_menu, &sel, NULL, false);
+    if (result >= 0 && result <= 4) {
+        p6_frameskip = result;
+        if (p6_frameskip == 0) {
+            frameskip    = 0;
+            p6_auto_skip = false;
+        } else {
+            frameskip    = p6_frameskip;
+            p6_auto_skip = false;
+        }
+    }
+}
+
+/* ── Full in-game menu ───────────────────────────────────────────────────── */
+static void show_ingame_menu(void)
+{
+    int sel = 0, result;
+    char vol_label[32];
+    char fs_label[32];
+
+    /* Build dynamic labels so current settings are visible. */
+    rb->snprintf(vol_label, sizeof(vol_label), "Volume (%d%%)", p6_volume);
+    rb->snprintf(fs_label,  sizeof(fs_label),
+                 "Frameskip (%s)",
+                 p6_frameskip == 0 ? "Auto" :
+                 p6_frameskip == 1 ? "1" :
+                 p6_frameskip == 2 ? "2" :
+                 p6_frameskip == 3 ? "3" : "4");
+
+#ifdef HAVE_WHEEL_POSITION
+    rb->wheel_send_events(true);
+#endif
+
+    /* Flush button queue before entering the menu to avoid stray inputs. */
+    while (rb->button_get(false) != BUTTON_NONE)
+        rb->yield();
+
+    MENUITEM_STRINGLIST(main_menu, "igpSP Menu", NULL,
+        "Resume",
+        "Save State",
+        "Load State",
+        vol_label,
+        fs_label,
+        "Cheats",
+        "Quit");
+
+    result = rb->do_menu(&main_menu, &sel, NULL, false);
+
+#ifdef HAVE_WHEEL_POSITION
+    rb->wheel_send_events(false);
+#endif
+
+    switch (result) {
+        case 0:   /* Resume */
+            break;
+        case 1:   /* Save State submenu */
+            show_save_submenu();
+            break;
+        case 2:   /* Load State submenu */
+            show_load_submenu();
+            break;
+        case 3:   /* Volume */
+            show_volume_menu();
+            break;
+        case 4:   /* Frameskip */
+            show_frameskip_menu();
+            break;
+        case 5:   /* Cheats */
+            show_cheats_menu();
+            break;
+        case 6:   /* Quit */
+            igpsp_sram_flush();
+            exit_requested = true;
+            break;
+        default:  /* BACK / MENU — treat as Resume */
+            break;
+    }
+
+    /* Clear button queue on return to prevent phantom GBA inputs. */
+    while (rb->button_get(false) != BUTTON_NONE)
+        rb->yield();
+    prev_wheel_zone = ZONE_NONE;
+}
+
+/* ── igpsp_phase6_init() — called from igpsp.c after load_gamepak() ──────── */
+
+/** Derive the ROM basename from a full path.
+ *  "/gba/Pokemon.gba" → "Pokemon"
+ *  "/path/Game.zip"   → "Game"
+ */
+static void p6_derive_basename(const char *rom_path)
+{
+    const char *slash = strrchr(rom_path, '/');
+    const char *name  = slash ? slash + 1 : rom_path;
+    const char *dot   = strrchr(name, '.');
+    size_t      len;
+
+    if (dot && dot > name)
+        len = (size_t)(dot - name);
+    else
+        len = strlen(name);
+
+    if (len >= sizeof(p6_rom_basename))
+        len = sizeof(p6_rom_basename) - 1u;
+
+    memcpy(p6_rom_basename, name, len);
+    p6_rom_basename[len] = '\0';
+}
+
+/**
+ * igpsp_phase6_init() — Phase 6 post-ROM-load initialisation.
+ *
+ * Call this from igpsp.c immediately after load_gamepak() returns 0.
+ *
+ * Actions:
+ *   1. Derive p6_rom_basename from the ROM path.
+ *   2. Override backup_filename to /gba/<rom>.sav so igpSP's own periodic
+ *      SRAM flush also lands in our /gba/ directory.
+ *   3. Load SRAM from /gba/<rom>.sav (preferred location); silently skip if
+ *      absent.
+ *   4. Load cheats from /gba/<rom>.cht if present.
+ *   5. Apply initial volume setting.
+ *   6. Seed the frame limiter start tick.
+ */
+void igpsp_phase6_init(const char *rom_path)
+{
+    char sav_path[512];
+    char cht_path[512];
+
+    if (!rom_path || rom_path[0] == '\0')
+        return;
+
+    /* 1. Derive basename. */
+    p6_derive_basename(rom_path);
+
+    /* 2. Override backup_filename so igpSP's internal update_backup() also
+     *    writes to /gba/<rom>.sav. */
+    ensure_gba_dir();
+    build_sav_path(sav_path, sizeof(sav_path));
+    strncpy(backup_filename, sav_path, sizeof(backup_filename) - 1);
+    backup_filename[sizeof(backup_filename) - 1] = '\0';
+
+    /* 3. Load SRAM from /gba/<rom>.sav.
+     *    igpSP's load_gamepak() already called load_backup() with the ROM's
+     *    own directory — override by calling load_backup() again with our path.
+     *    If the file doesn't exist, load_backup() is a no-op. */
+    load_backup(sav_path);
+
+    /* 4. Load cheats from /gba/<rom>.cht if present. */
+    build_cht_path(cht_path, sizeof(cht_path));
+    {
+        int fd = rb->open(cht_path, O_RDONLY, 0);
+        if (fd >= 0) {
+            rb->close(fd);
+            add_cheats((uint8_t *)cht_path);
+        }
+    }
+
+    /* 5. Apply initial volume. */
+    sound_set_volume(p6_volume);
+
+    /* 6. Seed frame limiter. */
+    p6_frame_start = sys_get_ticks();
+    {
+        int i;
+        for (i = 0; i < P6_FRAME_HIST; i++)
+            p6_frame_ms[i] = 16u;   /* assume 60 fps until measured */
+    }
+    p6_frame_idx = 0;
+    p6_auto_skip = false;
 }
 
 /* =========================================================================

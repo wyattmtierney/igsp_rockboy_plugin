@@ -65,8 +65,19 @@ The original iPod Linux layer used `/dev/fb` for video, `/dev/dsp` for audio, an
 | 2b | Video — ARM assembly optimised inner blit loop | 🔲 Pending |
 | 3 | Input — clickwheel d-pad zones, button binds, in-game menu | ✅ Complete |
 | 4 | Audio — lock-free PCM ring buffer, Rockbox mixer callback | ✅ Complete |
-| 5 | Core integration — malloc/POSIX shims, plugin_start() wired to igpSP loop | 🔧 In progress |
-| 6 | Polish — save states, SRAM saves, frame limiter, ZIP support | 🔲 Pending |
+| 5 | Core integration — malloc/POSIX shims, plugin_start() wired to igpSP loop | ✅ Complete |
+| 6 | Polish — save states, SRAM saves, frame limiter, ZIP support, cheats | ✅ Complete |
+
+### Phase 6 checklist
+
+| Item | Status |
+|---|---|
+| In-emulator menu — Resume, Save State, Load State, Volume, Frameskip, Cheats, Quit | ✅ |
+| Save state serialisation — IGSS magic header, 5 slots, timestamps in slot labels | ✅ |
+| SRAM battery save — load on ROM load, write on quit and save state | ✅ |
+| Frame rate limiter — 59.7 fps target, auto-frameskip on slow frames | ✅ |
+| ZIP ROM support — igpSP's `load_file_zip()` wired via `load_gamepak()` | ✅ |
+| Cheat code engine — `cheats.c` + `zip.c` enabled, `/gba/<rom>.cht` auto-loaded, toggle menu | ✅ |
 
 ---
 
