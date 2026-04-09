@@ -157,11 +157,18 @@ uint32_t input_read_keys(void);
 
 /**
  * input_exit() — release input resources.
- *
- * TODO Phase 3: disable scroll-wheel interrupt if we enabled it in
- *   input_init().
+ * Re-enables scroll-wheel event delivery for normal Rockbox operation.
  */
 void input_exit(void);
+
+/**
+ * exit_requested — set true by the in-game "Quit" menu option.
+ *
+ * The emulator main loop in igpsp.c checks this flag once per frame and
+ * breaks out when it is true, allowing plugin_start() to tear down cleanly.
+ * Reset to false by input_init().
+ */
+extern bool exit_requested;
 
 /* =========================================================================
  * AUDIO SUBSYSTEM

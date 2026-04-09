@@ -239,60 +239,224 @@ void vid_exit(void)
 #define WHEEL_LEFT_MIN      60u
 #define WHEEL_LEFT_MAX      83u
 
-static uint32_t current_keys = 0;   /* bitmask of GBA_KEY_* flags           */
+/*
+ * GBA KEYINPUT register is active-low: 0 = pressed, 1 = released, 10 bits.
+ * GBA_KEYINPUT_ALL_RELEASED (0x3FF) means every button is up.
+ * input_read_keys() returns this format directly so igpSP can write it
+ * straight into REG_P1 without any further inversion.
+ */
+#define GBA_KEYINPUT_ALL_RELEASED   0x3FFu
 
-void input_init(void)
+/* Cardinal zone identifiers for the wheel debounce state machine. */
+#define ZONE_NONE   (-1)
+#define ZONE_UP       0
+#define ZONE_RIGHT    1
+#define ZONE_DOWN     2
+#define ZONE_LEFT     3
+
+/* Current KEYINPUT register value written by input_poll(), read by
+ * input_read_keys().  Initialised to all-released. */
+static uint32_t current_keys    = GBA_KEYINPUT_ALL_RELEASED;
+
+/* Previous wheel zone for zone-change debounce (mirrors SCROLL_MOD). */
+static int      prev_wheel_zone = ZONE_NONE;
+
+/* Previous hold-switch state — used for rising-edge detection so the
+ * in-game menu appears exactly once per hold-switch engagement, not on
+ * every poll tick while the switch remains locked. */
+static bool     prev_hold       = false;
+
+/*
+ * exit_requested — set true by show_ingame_menu() when the user chooses
+ * "Quit".  The emulator main loop in igpsp.c checks this flag each frame
+ * and breaks out of the frame loop, returning cleanly to plugin_start().
+ * Declared extern in sys_rockbox_gba.h so igpsp.c can read it.
+ */
+bool exit_requested = false;
+
+/* -------------------------------------------------------------------------
+ * wheel_pos_to_zone() — map absolute clickwheel position (0–95) to one of
+ * four cardinal zones, or ZONE_NONE if the wheel is not being touched.
+ *
+ * North wraps through position 0:
+ *   [84..95] and [0..11]  →  ZONE_UP
+ *   [12..35]              →  ZONE_RIGHT
+ *   [36..59]              →  ZONE_DOWN
+ *   [60..83]              →  ZONE_LEFT
+ * ------------------------------------------------------------------------- */
+static int wheel_pos_to_zone(int pos)
 {
-    /* TODO Phase 3: enable hardware scroll-wheel interrupt for lower latency.
-     *   On iPod Classic, wheel position is read from the PortC GPIO block.
-     *   Rockbox may expose rb->scroll_wheel_enable_int() — check plugin API
-     *   version before calling.
-     *
-     *   If the API has no such call, rely on BUTTON_SCROLL_FWD /
-     *   BUTTON_SCROLL_BACK delta events and maintain a running accumulator:
-     *     int wheel_pos = 0;
-     *     // On SCROLL_FWD event: wheel_pos = (wheel_pos + 1) % 96;
-     *     // On SCROLL_BACK event: wheel_pos = (wheel_pos + 95) % 96;
-     */
-    current_keys = 0;
+    if (pos < 0)
+        return ZONE_NONE;
+    if (pos >= (int)WHEEL_UP_A_MIN || pos <= (int)WHEEL_UP_B_MAX)
+        return ZONE_UP;
+    if (pos <= (int)WHEEL_RIGHT_MAX)
+        return ZONE_RIGHT;
+    if (pos <= (int)WHEEL_DOWN_MAX)
+        return ZONE_DOWN;
+    return ZONE_LEFT;
 }
 
+/* -------------------------------------------------------------------------
+ * show_ingame_menu() — pause emulation and present the in-game menu.
+ *
+ * Uses Rockbox's MENUITEM_STRINGLIST / rb->do_menu() API (same approach
+ * Rockboy uses via do_user_menu()).  On Quit, sets exit_requested = true.
+ *
+ * Wheel events are re-enabled for menu navigation and suppressed again
+ * when control returns to the emulator loop.
+ * ------------------------------------------------------------------------- */
+MENUITEM_STRINGLIST(ingame_menu_ex, "igpSP Menu", NULL,
+    "Resume", "Save State", "Load State", "Quit");
+
+static void show_ingame_menu(void)
+{
+    int sel    = 0;
+    int result;
+
+#ifdef HAVE_WHEEL_POSITION
+    /* Allow the wheel to generate button-queue events for menu navigation. */
+    rb->wheel_send_events(true);
+#endif
+
+    result = rb->do_menu(&ingame_menu_ex, &sel, NULL, false);
+
+#ifdef HAVE_WHEEL_POSITION
+    /* Back to absolute-position polling; suppress queue events. */
+    rb->wheel_send_events(false);
+#endif
+
+    switch (result) {
+        case 0: /* Resume — return to emulator immediately */
+            break;
+        case 1: /* Save State — Phase 6 */
+            rb->splash(HZ, "Save State: coming in Phase 6");
+            break;
+        case 2: /* Load State — Phase 6 */
+            rb->splash(HZ, "Load State: coming in Phase 6");
+            break;
+        case 3: /* Quit — signal the emulator main loop to exit */
+            exit_requested = true;
+            break;
+        default: /* BACK / MENU pressed — treat as Resume */
+            break;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * input_init() — initialise the input subsystem.
+ *
+ * Disables scroll-wheel event-queue injection so delta BUTTON_SCROLL_FWD /
+ * BUTTON_SCROLL_BACK events do not accumulate in the button queue during
+ * emulation.  Absolute wheel position is read via rb->wheel_status() in
+ * input_poll() instead.
+ * ------------------------------------------------------------------------- */
+void input_init(void)
+{
+    current_keys    = GBA_KEYINPUT_ALL_RELEASED;
+    prev_wheel_zone = ZONE_NONE;
+    prev_hold       = false;
+    exit_requested  = false;
+
+#ifdef HAVE_WHEEL_POSITION
+    rb->wheel_send_events(false);
+#endif
+}
+
+/* -------------------------------------------------------------------------
+ * input_poll() — snapshot all input sources and build the GBA KEYINPUT word.
+ *
+ * Called once per emulated frame (~60 Hz) by the emulator main loop.
+ * Writes to current_keys in active-low KEYINPUT format (0 = pressed).
+ *
+ * Sources polled:
+ *   1. rb->button_hold()  — hold switch → in-game menu (rising-edge only)
+ *   2. rb->button_status() — physical click buttons → GBA face/shoulder keys
+ *   3. rb->wheel_status() — absolute wheel position → GBA D-pad
+ *
+ * Button mapping:
+ *   BUTTON_SELECT (centre click)  →  GBA A
+ *   BUTTON_PLAY   (play/pause)    →  GBA B
+ *   BUTTON_MENU   (menu)          →  GBA Start
+ *   BUTTON_LEFT   (rewind)        →  GBA Select
+ *   BUTTON_RIGHT  (forward)       →  GBA L trigger
+ *
+ * D-pad mapping (zone-change debounced):
+ *   Wheel North [84–95,0–11]  →  GBA Up
+ *   Wheel East  [12–35]       →  GBA Right
+ *   Wheel South [36–59]       →  GBA Down
+ *   Wheel West  [60–83]       →  GBA Left
+ * ------------------------------------------------------------------------- */
 void input_poll(void)
 {
-    /* TODO Phase 3: full implementation.
+    uint32_t keys = GBA_KEYINPUT_ALL_RELEASED;   /* 0x3FF = all up          */
+    bool     hold = rb->button_hold();
+
+    /* -----------------------------------------------------------------------
+     * Hold switch → in-game menu.
      *
-     *  uint32_t keys = 0;
+     * Rising-edge detection: show the menu exactly once per hold engagement.
+     * While the switch remains locked, keep all GBA keys released so the game
+     * does not receive stray inputs.
+     * --------------------------------------------------------------------- */
+    if (hold) {
+        if (!prev_hold) {
+            /* First frame the switch is on — show the menu. */
+            prev_hold = true;
+            show_ingame_menu();
+            prev_wheel_zone = ZONE_NONE;   /* clear stale wheel state        */
+        }
+        current_keys = GBA_KEYINPUT_ALL_RELEASED;
+        return;
+    }
+    prev_hold = false;
+
+    /* -----------------------------------------------------------------------
+     * Physical click buttons → GBA keys.
+     * rb->button_status() returns a non-blocking snapshot of currently-held
+     * buttons (same as Rockboy's ev_poll() approach).
+     * Clearing a bit in `keys` means that GBA key is pressed (active-low).
+     * --------------------------------------------------------------------- */
+    {
+        int btn = rb->button_status();
+
+        if (btn & BUTTON_SELECT) keys &= ~GBA_KEY_A;      /* centre → A     */
+        if (btn & BUTTON_PLAY)   keys &= ~GBA_KEY_B;      /* play   → B     */
+        if (btn & BUTTON_MENU)   keys &= ~GBA_KEY_START;  /* menu   → Start */
+        if (btn & BUTTON_LEFT)   keys &= ~GBA_KEY_SELECT; /* rewind → Sel   */
+        if (btn & BUTTON_RIGHT)  keys &= ~GBA_KEY_L;      /* fwd    → L     */
+    }
+
+    /* -----------------------------------------------------------------------
+     * Clickwheel → GBA D-pad (absolute position, zone-change debounce).
      *
-     *  // --- Physical click buttons ---
-     *  int btn = rb->button_status();  // non-blocking snapshot
+     * rb->wheel_status() returns the current absolute position 0–95 or -1.
+     * We map to four cardinal zones and apply the direction every frame.
      *
-     *  if (btn & BUTTON_SELECT) keys |= GBA_KEY_A;
-     *  if (btn & BUTTON_PLAY)   keys |= GBA_KEY_B;
-     *  if (btn & BUTTON_MENU)   keys |= GBA_KEY_START;
-     *  if (btn & BUTTON_LEFT)   keys |= GBA_KEY_SELECT;
-     *  if (btn & BUTTON_RIGHT)  keys |= GBA_KEY_R;
-     *
-     *  // --- Scroll wheel → D-pad ---
-     *  //  Option A: absolute position (preferred)
-     *  //    int pos = rb->wheel_status();  // 0-95
-     *  //
-     *  //  Option B: accumulate delta events from the button queue.
-     *  //    Drain queue with rb->button_get(false) in a loop until 0.
-     *
-     *  //  Map position to cardinal direction:
-     *  //    if (pos >= WHEEL_UP_A_MIN || pos <= WHEEL_UP_B_MAX)
-     *  //        keys |= GBA_KEY_UP;
-     *  //    else if (pos <= WHEEL_RIGHT_MAX) keys |= GBA_KEY_RIGHT;
-     *  //    else if (pos <= WHEEL_DOWN_MAX)  keys |= GBA_KEY_DOWN;
-     *  //    else                             keys |= GBA_KEY_LEFT;
-     *
-     *  // --- Long MENU press → emulator exit ---
-     *  //    Track a press-duration counter here; if MENU held > 1 s,
-     *  //    set a global exit_requested flag checked by the main loop.
-     *
-     *  current_keys = keys;
-     */
-    current_keys = 0; /* stub: no keys pressed — placeholder screen stays up */
+     * Zone-change debounce (mirrors SCROLL_MOD from igpSP's ipod_input.h):
+     * prev_wheel_zone is updated only when the zone changes.  This suppresses
+     * jitter when a finger rests near a zone boundary and prevents a new D-pad
+     * press being registered on every poll tick while the wheel is stationary.
+     * --------------------------------------------------------------------- */
+#ifdef HAVE_WHEEL_POSITION
+    {
+        int pos  = rb->wheel_status();        /* -1 or 0..95                */
+        int zone = wheel_pos_to_zone(pos);
+
+        if (zone != prev_wheel_zone)
+            prev_wheel_zone = zone;           /* latch new zone on change   */
+
+        switch (prev_wheel_zone) {
+            case ZONE_UP:    keys &= ~GBA_KEY_UP;    break;
+            case ZONE_RIGHT: keys &= ~GBA_KEY_RIGHT; break;
+            case ZONE_DOWN:  keys &= ~GBA_KEY_DOWN;  break;
+            case ZONE_LEFT:  keys &= ~GBA_KEY_LEFT;  break;
+            default: break;   /* ZONE_NONE: finger lifted, no D-pad active  */
+        }
+    }
+#endif /* HAVE_WHEEL_POSITION */
+
+    current_keys = keys;
 }
 
 uint32_t input_read_keys(void)
@@ -300,10 +464,19 @@ uint32_t input_read_keys(void)
     return current_keys;
 }
 
+/* -------------------------------------------------------------------------
+ * input_exit() — release input resources.
+ *
+ * Restores scroll-wheel event delivery so Rockbox can use the wheel normally
+ * after the plugin exits.
+ * ------------------------------------------------------------------------- */
 void input_exit(void)
 {
-    /* TODO Phase 3: disable scroll-wheel interrupt if we enabled it. */
-    current_keys = 0;
+#ifdef HAVE_WHEEL_POSITION
+    rb->wheel_send_events(true);
+#endif
+    current_keys    = GBA_KEYINPUT_ALL_RELEASED;
+    prev_wheel_zone = ZONE_NONE;
 }
 
 /* =========================================================================
