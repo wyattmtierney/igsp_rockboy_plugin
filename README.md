@@ -111,11 +111,13 @@ igsp_rockboy_plugin/
   - [ ] Phase 2b: Replace `blit_frame_c()` with ARM asm inner loop
   - [ ] (Optional) Integer EPX / bilinear filter
 
-- [ ] **Phase 3 — Input**
-  - [ ] Read absolute clickwheel position (0–95) via Rockbox API
-  - [ ] Map 4 cardinal zones to GBA D-pad
-  - [ ] Map physical click buttons (SELECT/PLAY/MENU/LEFT/RIGHT) to A/B/Start/Select/R
-  - [ ] Long-MENU press → in-emulator menu / exit request
+- [x] **Phase 3 — Input**
+  - [x] Read absolute clickwheel position (0–95) via `rb->wheel_status()`
+  - [x] Map 4 cardinal zones to GBA D-pad (zone-change debounce, mirrors SCROLL_MOD)
+  - [x] Map physical click buttons: SELECT→A, PLAY→B, MENU→Start, LEFT→Select, RIGHT→L
+  - [x] Hold switch (rising-edge) → in-game menu: Resume / Save State / Load State / Quit
+  - [x] Quit sets `exit_requested = true`; emulator main loop exits cleanly
+  - [x] `input_read_keys()` returns active-low GBA KEYINPUT format (0x3FF = all released)
 
 - [ ] **Phase 4 — Audio**
   - [ ] Allocate lock-free PCM ring buffer from plugin heap
