@@ -38,12 +38,24 @@ igsp_rockboy_plugin/
 ├── platform/
 │   └── rockbox/
 │       ├── sys_rockbox_gba.h       # Platform abstraction API (public header)
-│       └── sys_rockbox_gba.c       # Stub implementations (all Rockbox calls here)
-├── src/                            # igpSP emulator core (populated Phase 2–5)
+│       └── sys_rockbox_gba.c       # Full implementations (all Rockbox calls here)
+├── src/
+│   ├── rockbox_compat.h            # Phase 5: malloc/FILE*/POSIX/exit shim
+│   │                               #   injected via -include into igpSP core files
+│   ├── main.c                      # igpSP: emulator loop, update_gba(), quit()
+│   ├── cpu.c                       # igpSP: ARM interpreter
+│   ├── cpu_threaded.c              # igpSP: ARM JIT dynarec (MUST be -marm)
+│   ├── memory.c                    # igpSP: GBA memory map, ROM/BIOS load
+│   ├── video.c                     # igpSP: GBA PPU renderer
+│   ├── sound.c                     # igpSP: GBA APU mixer
+│   ├── common.h / memory.h / …     # igpSP headers (copy from upstream)
 │   └── .gitkeep
 ├── .gitignore
 └── README.md
 ```
+> **Note:** `src/*.c` and `src/*.h` (except `rockbox_compat.h`) are igpSP upstream
+> source files and are not tracked in this repository.  Copy them from
+> https://github.com/iPodLinux-Community/igpSP before building.
 
 **Invariant:** Nothing inside `src/` may include `plugin.h` or call `rb->` directly.  All Rockbox API access is funnelled through `platform/rockbox/sys_rockbox_gba.{h,c}`.
 
@@ -129,12 +141,48 @@ igsp_rockboy_plugin/
   - [x] COP replacement documented — PP502x registers absent on S5L8702; Rockbox DMA IRQ covers the same role
   - [x] Ring buffer depth: 4096 stereo frames (≈ 11 video frames @ 22050 Hz / 60 fps)
 
-- [ ] **Phase 5 — CPU Core Integration**
-  - [ ] Copy igpSP `src/` files into repo
-  - [ ] Wire `common.h` platform guards: `#ifdef ROCKBOX` paths throughout
-  - [ ] Implement `load_gamepak()` using `sys_open/read/seek`
-  - [ ] Implement `load_gba_bios()` (requires user-supplied `gba_bios.bin`)
-  - [ ] Verify `cpu_threaded.c` compiles as ARM32 (never Thumb)
+- [x] **Phase 5 — Memory, Filesystem, Core Integration**
+  - [x] `src/rockbox_compat.h` shim: `-include` injected via `IGPSP_CORE_CFLAGS`
+    - [x] `malloc` → `sys_malloc`, `calloc` → `rb_calloc`, `free` → no-op
+    - [x] `fopen/fread/fwrite/fclose/fseek/ftell/fgets` → `rb_f*()` wrappers
+    - [x] `open/read/write/close/lseek` → `sys_open/read/write/close/seek`
+    - [x] `exit(code)` → `longjmp(igpsp_exit_jmp, 1)` for clean Rockbox exit
+    - [x] `IPOD_BUILD` defined to select igpSP's iPod code paths (no SDL)
+    - [x] `sound_exit` → `igpsp_sound_exit`, `sound_callback` → `igpsp_sound_callback` (avoid link conflicts)
+    - [x] `usleep/sleep` → `sys_sleep_ms`, `getcwd` → stub returning "/"
+    - [x] `printf/fprintf` → `DEBUGF` (compiled out in release)
+    - [x] `IGPSP_DEBUG` build: `sys_malloc_debug()` logs each allocation to LCD
+    - [x] Memory layout documentation: ~20.7 MB total (ROM cap 16 MB), ~40 MB headroom on 6G
+  - [x] `sys_rockbox_gba.c` additions:
+    - [x] `FILE*` slot pool (8 slots, bump-allocated): `rb_fopen/fclose/fread/fwrite/fseek/ftell/fgets/feof`
+    - [x] `rb_file_length()` — seek-to-end, report size, seek back
+    - [x] `rb_file_pool_init()` called from `sys_mem_init()` after heap is ready
+    - [x] `sys_malloc()` OOM guard: splash + degenerate fallback pointer
+    - [x] `sys_mem_init()` minimum heap check (20 MB threshold with error splash)
+    - [x] `ipod_init_hw/exit_hw/exit_video` → `vid_init/exit`
+    - [x] `ipod_init_input/exit_input` → `input_init/exit`
+    - [x] `ipod_init_sound/exit_sound` → `sound_init(22050,2)/sound_exit`
+    - [x] `ipod_init_cop/exit_cop` — no-op (no PP502x COP on S5L8702)
+    - [x] `ipod_init_conf/exit_conf` — Phase 6 stub (settings persistence)
+    - [x] `ipod_update_ingame_input()` → `input_poll()` + exit-check + active-HIGH key return
+    - [x] `update_screen()` → `vid_update(screen)` (bridges igpSP PPU output to Rockbox LCD)
+    - [x] `get_ticks_us()` / `delay_us()` — timing shims for igpSP's `synchronize()`
+    - [x] `print_string()` — silenced (Phase 6: optional FPS overlay)
+    - [x] `sys_malloc_debug()` — IGPSP_DEBUG allocation logger
+  - [x] `igpsp.c` rewritten — full Phase 5 startup sequence:
+    - [x] BIOS path search: ROM directory first, then `/.rockbox/igpsp/gba_bios.bin`
+    - [x] `main_path` set to ROM's directory before igpSP config/BIOS lookup
+    - [x] `init_gamepak_buffer()` → `load_bios()` → `init_main()` → `igpsp_init_sound()` → `init_input()` → `load_gamepak()` → `init_cpu()` → `init_memory()` — matches original `main()` order
+    - [x] `setjmp(igpsp_exit_jmp)` guard around `execute_arm_translate()` for clean exit
+    - [x] All error paths: splash readable message → cleanup → `PLUGIN_ERROR`
+    - [x] Teardown in reverse init order; idempotent cleanup safe after longjmp
+  - [x] `igpsp.make` updated:
+    - [x] `IGPSP_CORE_CFLAGS` = base flags + `-include rockbox_compat.h -DIPOD_BUILD -fno-strict-aliasing -I src/`
+    - [x] Explicit rules for `igpsp.o` and `sys_rockbox_gba.o` use `IGPSP_CFLAGS` (no shim)
+    - [x] `src/` engine files compiled with `IGPSP_CORE_CFLAGS` via pattern rule
+    - [x] `cpu_threaded.c` special rule preserved: `-marm -fno-strict-aliasing` forced
+    - [x] Enabled: `main.c cpu.c cpu_threaded.c memory.c video.c sound.c`
+  - [ ] Populate `src/` with igpSP source files (copy from upstream repo — not tracked in git)
   - [ ] Integration-test: run first frame of a ROM without hang/crash
 
 - [ ] **Phase 6 — Polish**
