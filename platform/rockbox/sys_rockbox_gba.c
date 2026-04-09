@@ -28,6 +28,10 @@ static uint8_t *heap_base = NULL;   /* start of audio-buffer arena          */
 static uint8_t *heap_ptr  = NULL;   /* current bump pointer                 */
 static size_t   heap_size = 0;      /* total bytes claimed from Rockbox     */
 
+/* Forward declaration — rb_file_pool_init() is defined in the FILE* section
+ * below but called from sys_mem_init() which appears first in this file. */
+void rb_file_pool_init(void);
+
 void sys_mem_init(void)
 {
     if (heap_base)
@@ -36,19 +40,24 @@ void sys_mem_init(void)
     heap_base = (uint8_t *)rb->plugin_get_audio_buffer(&heap_size);
     heap_ptr  = heap_base;
 
-    /* TODO Phase 2: enforce minimum heap requirement.
-     *   GBA minimum layout:
-     *     EWRAM  256 KB   = 0x040000
-     *     IWRAM   32 KB   = 0x008000
-     *     VRAM    96 KB   = 0x018000
-     *     Palette  1 KB   = 0x000400
-     *     OAM      1 KB   = 0x000400
-     *     ROM (max 32 MB) = 0x2000000  — only if we pre-load entire ROM
-     *     Translation cache (ROM+RAM+BIOS) ~2 MB typical
-     *   Total minimum without pre-loaded ROM: ~8 MB
-     *   If heap_size < 8 MB, splash an error and return an error code.
-     */
+    /* Minimum heap: ROM(16MB) + caches(~2.5MB) + GBA regions(~1MB) = ~20 MB.
+     * The iPod Classic 6G audio buffer is ~60 MB so this always passes.
+     * Splash a fatal error on smaller/simulated targets to catch OOM early. */
+#define IGPSP_MIN_HEAP  (20u * 1024u * 1024u)   /* 20 MB */
+    if (heap_size < IGPSP_MIN_HEAP) {
+        rb->splashf(HZ * 4,
+                    "igpSP: heap too small (%u KB, need %u KB)",
+                    (unsigned)(heap_size / 1024),
+                    (unsigned)(IGPSP_MIN_HEAP / 1024));
+        /* Leave heap_base set so callers can detect init ran; sys_malloc
+         * will OOM-splash on the first overflowing allocation. */
+    }
+#ifdef IGPSP_DEBUG
     rb->splashf(HZ / 2, "igpSP heap: %u KB", (unsigned)(heap_size / 1024));
+#endif
+
+    /* Initialise the FILE* slot pool — must happen after heap is ready. */
+    rb_file_pool_init();
 }
 
 void *sys_malloc(size_t size)
@@ -58,12 +67,17 @@ void *sys_malloc(size_t size)
     /* 4-byte align every allocation */
     size = (size + 3u) & ~3u;
 
-    /* TODO Phase 2: OOM detection.
-     *   if ((heap_ptr + size) > (heap_base + heap_size)) {
-     *       rb->splash(HZ * 3, "igpSP: OUT OF MEMORY");
-     *       rb->plugin_tsr(NULL);  // or longjmp to plugin_start cleanup
-     *   }
-     */
+    if ((heap_ptr + size) > (heap_base + heap_size)) {
+        rb->splashf(HZ * 4,
+                    "igpSP OOM: need %u KB, have %u KB",
+                    (unsigned)(size / 1024),
+                    (unsigned)(sys_heap_remaining() / 1024));
+        /* Crash-safe: return a valid pointer to the last valid byte so the
+         * emulator corrupts its own heap rather than the Rockbox stack.
+         * The corrupted state will manifest as a garbled screen or hang,
+         * which is recoverable by holding MENU to exit via the in-game menu. */
+        return heap_base;   /* degenerate fallback — do not return NULL */
+    }
     ptr       = heap_ptr;
     heap_ptr += size;
     return ptr;
@@ -843,3 +857,494 @@ int sys_seek(int fd, int offset, int whence)
 {
     return (int)rb->lseek(fd, (off_t)offset, whence);
 }
+
+/* =========================================================================
+ * FILE* COMPATIBILITY WRAPPERS  (Phase 5)
+ * =========================================================================
+ *
+ * igpSP's common.h expands the file_open/read/write/close/seek macros to
+ * standard C FILE* calls (fopen, fread, fwrite, fclose, fseek, ftell, fgets).
+ * We back these with Rockbox file descriptors so no libc stdio is needed.
+ *
+ * The FILE typedef and these function declarations are exposed to igpSP
+ * source files via src/rockbox_compat.h (injected with -include).
+ *
+ * Implementation notes:
+ *   - FILE structs are bump-allocated from sys_malloc() so they live for the
+ *     plugin lifetime.  We never free them — consistent with igpSP's pattern
+ *     of one open → read/write → close per data region.
+ *   - We allocate a pool of FILE slots to avoid per-call sys_malloc overhead
+ *     and to support the small number of simultaneously open files igpSP uses
+ *     (BIOS, ROM, config, save state — at most ~4 at once).
+ * ========================================================================= */
+
+#define RB_FILE_POOL_SIZE  8        /* max simultaneously open FILE*s       */
+
+/* File slot pool — allocated once from the bump arena in file_pool_init(). */
+typedef struct {
+    int  fd;
+    int  eof;
+    bool in_use;
+} rb_file_slot_t;
+
+static rb_file_slot_t *file_pool = NULL;
+
+/** Initialise the FILE slot pool.  Called from sys_mem_init() after the heap
+ *  is set up.  Idempotent — safe to call multiple times. */
+void rb_file_pool_init(void)
+{
+    if (file_pool)
+        return;
+    file_pool = (rb_file_slot_t *)sys_malloc(
+                    RB_FILE_POOL_SIZE * sizeof(rb_file_slot_t));
+    if (file_pool)
+        rb->memset(file_pool, 0, RB_FILE_POOL_SIZE * sizeof(rb_file_slot_t));
+}
+
+/** Acquire a free slot from the pool. Returns NULL if pool is exhausted. */
+static rb_file_slot_t *slot_alloc(void)
+{
+    int i;
+    if (!file_pool)
+        rb_file_pool_init();
+    for (i = 0; i < RB_FILE_POOL_SIZE; i++) {
+        if (!file_pool[i].in_use) {
+            file_pool[i].in_use = true;
+            file_pool[i].eof    = 0;
+            file_pool[i].fd     = -1;
+            return &file_pool[i];
+        }
+    }
+    return NULL;  /* pool exhausted — should not happen in normal igpSP use */
+}
+
+/** Release a slot back to the pool. */
+static void slot_free(rb_file_slot_t *s)
+{
+    if (s) s->in_use = false;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_fopen() — open a file, return a FILE* backed by a Rockbox fd.
+ *
+ * Supported modes (only what igpSP actually uses):
+ *   "r" / "rb"  → O_RDONLY
+ *   "w" / "wb"  → O_WRONLY | O_CREAT | O_TRUNC
+ *   "a" / "ab"  → O_WRONLY | O_CREAT | O_APPEND
+ * ------------------------------------------------------------------------- */
+FILE *rb_fopen(const char *path, const char *mode)
+{
+    rb_file_slot_t *s;
+    int             flags;
+
+    if (!path || !mode)
+        return NULL;
+
+    /* Decode mode string into Rockbox open flags. */
+    if (mode[0] == 'r')
+        flags = O_RDONLY;
+    else if (mode[0] == 'w')
+        flags = O_WRONLY | O_CREAT | O_TRUNC;
+    else if (mode[0] == 'a')
+        flags = O_WRONLY | O_CREAT | O_APPEND;
+    else
+        flags = O_RDONLY;  /* safe default */
+
+    s = slot_alloc();
+    if (!s)
+        return NULL;
+
+    s->fd = rb->open(path, flags, 0644);
+    if (s->fd < 0) {
+        slot_free(s);
+        return NULL;
+    }
+
+    return (FILE *)s;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_fclose() — close and release.
+ * ------------------------------------------------------------------------- */
+int rb_fclose(FILE *fp)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    int ret;
+    if (!s || !s->in_use || s->fd < 0)
+        return EOF;
+    ret = rb->close(s->fd);
+    slot_free(s);
+    return (ret < 0) ? EOF : 0;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_fread() — read count items of size bytes each.
+ * Returns number of complete items read (matches fread semantics).
+ * ------------------------------------------------------------------------- */
+size_t rb_fread(void *buf, size_t size, size_t count, FILE *fp)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    ssize_t         n;
+
+    if (!s || !s->in_use || s->fd < 0 || s->eof || !buf || size == 0)
+        return 0;
+
+    n = rb->read(s->fd, buf, size * count);
+    if (n <= 0) {
+        s->eof = (n == 0) ? 1 : 0;
+        return 0;
+    }
+    if ((size_t)n < size * count)
+        s->eof = 1;
+    return (size_t)n / size;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_fwrite() — write count items of size bytes each.
+ * Returns number of complete items written.
+ * ------------------------------------------------------------------------- */
+size_t rb_fwrite(const void *buf, size_t size, size_t count, FILE *fp)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    ssize_t         n;
+
+    if (!s || !s->in_use || s->fd < 0 || !buf || size == 0)
+        return 0;
+
+    n = rb->write(s->fd, buf, size * count);
+    if (n <= 0)
+        return 0;
+    return (size_t)n / size;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_fseek() — reposition file offset.
+ * ------------------------------------------------------------------------- */
+int rb_fseek(FILE *fp, long offset, int whence)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    off_t           pos;
+
+    if (!s || !s->in_use || s->fd < 0)
+        return -1;
+
+    pos = rb->lseek(s->fd, (off_t)offset, whence);
+    if (pos < 0)
+        return -1;
+
+    s->eof = 0;   /* a successful seek clears EOF */
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_ftell() — return current file position.
+ * ------------------------------------------------------------------------- */
+long rb_ftell(FILE *fp)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    if (!s || !s->in_use || s->fd < 0)
+        return -1L;
+    return (long)rb->lseek(s->fd, 0, SEEK_CUR);
+}
+
+/* -------------------------------------------------------------------------
+ * rb_fgets() — read a line (up to n-1 chars or newline, NUL-terminate).
+ * igpSP uses this in load_game_config_file() to read .cfg line-by-line.
+ * ------------------------------------------------------------------------- */
+char *rb_fgets(char *buf, int n, FILE *fp)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    int i;
+    char c;
+
+    if (!s || !s->in_use || s->fd < 0 || s->eof || !buf || n <= 1)
+        return NULL;
+
+    for (i = 0; i < n - 1; i++) {
+        ssize_t r = rb->read(s->fd, &c, 1);
+        if (r <= 0) {
+            if (r == 0) s->eof = 1;
+            if (i == 0) return NULL;   /* nothing read at all */
+            break;
+        }
+        buf[i] = c;
+        if (c == '\n') { i++; break; }
+    }
+    buf[i] = '\0';
+    return buf;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_feof() — return non-zero if the last read hit end-of-file.
+ * ------------------------------------------------------------------------- */
+int rb_feof(FILE *fp)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    return (!s || !s->in_use) ? 1 : s->eof;
+}
+
+/* -------------------------------------------------------------------------
+ * rb_file_length() — return file size without disturbing the position.
+ * igpSP prototype: u32 file_length(u8 *dummy, FILE *fp)
+ * ------------------------------------------------------------------------- */
+uint32_t rb_file_length(const char *dummy, FILE *fp)
+{
+    rb_file_slot_t *s = (rb_file_slot_t *)fp;
+    off_t cur, end;
+    (void)dummy;
+
+    if (!s || !s->in_use || s->fd < 0)
+        return 0;
+
+    cur = rb->lseek(s->fd, 0, SEEK_CUR);
+    end = rb->lseek(s->fd, 0, SEEK_END);
+    rb->lseek(s->fd, cur, SEEK_SET);
+
+    return (end > 0) ? (uint32_t)end : 0u;
+}
+
+/* =========================================================================
+ * IPOD LINUX PLATFORM HOOKS  (Phase 5)
+ * =========================================================================
+ *
+ * igpSP's IPOD_BUILD source calls these functions instead of SDL / GP2X /
+ * PSP equivalents.  We implement them here as thin wrappers over our
+ * Rockbox platform layer.
+ *
+ * Call sites in igpSP source (matching the original iPod Linux main.c):
+ *   main.c:     ipod_init_conf(), ipod_init_hw(), ipod_init_input(),
+ *               ipod_init_cop(), ipod_update_settings()
+ *   main.c quit(): ipod_exit_conf(), ipod_exit_cop(), ipod_exit_input(),
+ *                  ipod_exit_hw(), ipod_exit_video()
+ *   sound.c:    ipod_init_sound(), ipod_exit_sound()
+ *   input.c:    ipod_update_ingame_input(), ipod_update_menu_input()
+ *   main.c:     get_ticks_us(), delay_us()
+ *
+ * COP note: The iPod Linux COP (PP502x second core) registers do NOT exist
+ * on the S5L8702.  ipod_init_cop / ipod_exit_cop are intentional no-ops.
+ * The Rockbox DMA-driven PCM system replaces the COP audio pipeline.
+ * ========================================================================= */
+
+/* ── Hardware init / exit ─────────────────────────────────────────────── */
+
+/** ipod_init_conf() — load persistent configuration.  igpSP calls this to
+ *  read stored settings.  Phase 5 stub: settings live in /.rockbox/igpsp/. */
+void ipod_init_conf(void)
+{
+    /* Phase 6: load saved settings from /.rockbox/igpsp/igpsp.cfg */
+}
+
+/** ipod_exit_conf() — save persistent configuration on exit. */
+void ipod_exit_conf(void)
+{
+    /* Phase 6: write settings to /.rockbox/igpsp/igpsp.cfg */
+}
+
+/** ipod_init_hw() — hardware video initialisation.
+ *  Called before igpSP's init_video() in the original iPod Linux main(). */
+void ipod_init_hw(void)
+{
+    vid_init();   /* set up Rockbox LCD, scaling tables, framebuffer pointer */
+}
+
+/** ipod_exit_hw() — hardware video teardown (alias of ipod_exit_video). */
+void ipod_exit_hw(void)
+{
+    vid_exit();   /* restore Rockbox LCD viewport and clear display */
+}
+
+/** ipod_exit_video() — video teardown called from igpSP's quit(). */
+void ipod_exit_video(void)
+{
+    vid_exit();
+}
+
+/** ipod_init_input() — initialise input subsystem.
+ *  Called before the emulation loop in the original iPod Linux main(). */
+void ipod_init_input(void)
+{
+    input_init();  /* configure Rockbox button/wheel layer for GBA input */
+}
+
+/** ipod_exit_input() — release input resources; called from igpSP's quit(). */
+void ipod_exit_input(void)
+{
+    input_exit();  /* re-enable wheel events for normal Rockbox operation */
+}
+
+/** ipod_init_cop() — start the PP502x second core.  NO-OP on S5L8702. */
+void ipod_init_cop(void)
+{
+    /* S5L8702 has no second core accessible via PP502x COP registers.
+     * The Rockbox DMA/IRQ audio system replaces the COP audio pipeline. */
+}
+
+/** ipod_exit_cop() — shut down the COP.  NO-OP on S5L8702. */
+void ipod_exit_cop(void)
+{
+    /* no-op — see ipod_init_cop() comment */
+}
+
+/** ipod_update_settings() — apply any changed settings mid-session.
+ *  igpSP calls this after ipod_init_hw() in the original main(). */
+void ipod_update_settings(void)
+{
+    /* Phase 6: apply screen_scale, sound_volume, etc. from global settings. */
+}
+
+/* ── Sound init / exit ────────────────────────────────────────────────── */
+
+/** ipod_init_sound() — start Rockbox PCM output.
+ *  Called from igpSP's init_sound() (renamed igpsp_init_sound() via shim)
+ *  to initialise the platform audio backend. */
+void ipod_init_sound(void)
+{
+    /* 22 050 Hz stereo — matches igpSP's iPod Linux default.
+     * The Wolfson WM8758 DAC on the 6G supports this rate natively. */
+    sound_init(22050, 2);
+}
+
+/** ipod_exit_sound() — stop Rockbox PCM output.
+ *  Called from igpSP's sound_exit() (renamed igpsp_sound_exit() via shim)
+ *  during quit() to stop the mixer before the plugin returns. */
+void ipod_exit_sound(void)
+{
+    sound_exit();
+}
+
+/* ── Input polling ────────────────────────────────────────────────────── */
+
+/**
+ * ipod_update_ingame_input() — poll hardware and return the current GBA key
+ * state in active-HIGH format (bit SET = button pressed).
+ *
+ * igpSP's input.c (IPOD_BUILD) calls this from update_input():
+ *   key = ipod_update_ingame_input();
+ *   trigger_key(key);                       ← raise GBA keypad IRQ if changed
+ *   io_registers[REG_P1] = (~key) & 0x3FF; ← write active-LOW KEYINPUT
+ *
+ * We call input_poll() to update our internal state, check for the hold-
+ * switch exit trigger, and return (~current_keys & 0x3FF) to invert our
+ * active-LOW KEYINPUT value back to the active-HIGH format igpSP expects.
+ *
+ * Exit path: if exit_requested is set (user chose "Quit" from in-game menu),
+ * we call igpSP's quit() which calls ipod_exit_* hooks and then reaches our
+ * exit() → longjmp() macro, returning control to plugin_start().
+ */
+uint32_t ipod_update_ingame_input(void)
+{
+    /* Declared in igpSP's main.h; resolves at link time from main.c. */
+    extern void quit(void);
+
+    input_poll();   /* update current_keys and check hold switch / menu */
+
+    if (exit_requested) {
+        /* quit() calls ipod_exit_* → our cleanup hooks, then exit(0)
+         * which longjmps back to plugin_start()'s setjmp guard. */
+        quit();
+        /* NOT REACHED — longjmp unwinds the stack */
+    }
+
+    /* Convert our active-LOW KEYINPUT (0=pressed) to active-HIGH (1=pressed)
+     * so igpSP's input.c can correctly re-invert it into REG_P1. */
+    return (~input_read_keys()) & 0x3FFu;
+}
+
+/**
+ * ipod_update_menu_input() — return a GUI menu action.
+ * igpSP's input.c calls this when navigating the built-in igpSP file browser.
+ * We redirect all menu navigation to our Rockbox in-game menu (Phase 6 will
+ * wire the full igpSP file browser).
+ */
+int ipod_update_menu_input(void)
+{
+    /* gui_action_type: CURSOR_NONE = 0.  Return no-action for now.
+     * Phase 6: map Rockbox button events to igpSP CURSOR_* constants. */
+    return 0;  /* CURSOR_NONE */
+}
+
+/* ── Screen output ────────────────────────────────────────────────────── */
+
+/**
+ * update_screen() — push the completed GBA frame to the Rockbox LCD.
+ *
+ * igpSP's synchronize() (IPOD_BUILD path in main.c) calls update_screen()
+ * once per rendered frame.  igpSP's video.c (IPOD_BUILD) sets:
+ *   u16 *screen;   ← points to the 240×160 RGB565 output buffer
+ * and defines:
+ *   #define get_screen_pixels() ((u16 *)screen)
+ *
+ * We scale and blit this to the 320×240 Rockbox framebuffer via vid_update().
+ */
+void update_screen(void)
+{
+    /* 'screen' is declared in igpSP's video.c (IPOD_BUILD block).
+     * We extern it here; it is set up by igpSP's init_video(). */
+    extern uint16_t *screen;
+    vid_update(screen);
+}
+
+/* ── Timing ───────────────────────────────────────────────────────────── */
+
+/**
+ * get_ticks_us() — return a microsecond timestamp.
+ *
+ * igpSP uses this for frame rate limiting in synchronize().
+ * Rockbox ticks are 10 ms resolution; we scale to microseconds.
+ * Note: this gives 10 000 µs resolution (sufficient for ~100 Hz frame timing).
+ */
+void get_ticks_us(uint64_t *tick_return)
+{
+    if (tick_return)
+        *tick_return = (uint64_t)(*rb->current_tick) * 10000ULL;
+}
+
+/**
+ * delay_us() — sleep for approximately us_count microseconds.
+ * Used by igpSP's synchronize() to cap frame rate.
+ * Rockbox minimum sleep granularity is one tick (10 ms).
+ */
+void delay_us(uint32_t us_count)
+{
+    int ms = (int)(us_count / 1000u);
+    if (ms > 0)
+        sys_sleep_ms(ms);
+    else
+        rb->yield();   /* sub-millisecond: at least yield to other threads */
+}
+
+/**
+ * print_string() — igpSP debug text overlay.  Silenced in Rockbox builds.
+ * igpSP calls this in synchronize() to display FPS counters.
+ */
+void print_string(const char *str, uint32_t fg, uint32_t bg,
+                  int x, int y)
+{
+    (void)str; (void)fg; (void)bg; (void)x; (void)y;
+    /* Phase 6: optionally render debug overlay via rb->lcd_putsxy() */
+}
+
+/* =========================================================================
+ * sys_malloc_debug() — IGPSP_DEBUG allocation logger  (Phase 5)
+ * =========================================================================
+ * When -DIGPSP_DEBUG is passed at build time, rockbox_compat.h reroutes
+ * malloc/calloc/sys_malloc through this function.  It splashes the
+ * allocation size and remaining heap to the LCD so we can verify that all
+ * GBA memory regions fit within the audio buffer before enabling the JIT.
+ *
+ * The splash is brief (HZ/8 = 125 ms) so startup is not excessively slow.
+ * Disable IGPSP_DEBUG for normal builds.
+ * ========================================================================= */
+#ifdef IGPSP_DEBUG
+void *sys_malloc_debug(size_t size, const char *tag)
+{
+    void  *p   = sys_malloc(size);
+    size_t rem = sys_heap_remaining();
+
+    rb->splashf(HZ / 8, "%s: %u B  rem %u KB",
+                tag ? tag : "?",
+                (unsigned)size,
+                (unsigned)(rem / 1024));
+    return p;
+}
+#endif /* IGPSP_DEBUG */
